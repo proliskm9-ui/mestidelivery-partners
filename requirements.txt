@@ -4,4 +4,4 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 
 bcrypt==4.1.2
-pyngrok
+Pillow==11.3.0
