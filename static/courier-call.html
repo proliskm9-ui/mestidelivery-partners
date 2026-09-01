@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Позвонить клиенту</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 28px 20px calc(28px + env(safe-area-inset-bottom));
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--tg-theme-bg-color, #17212b);
+      color: var(--tg-theme-text-color, #ffffff);
+      text-align: center;
+    }
+    .icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 34px;
+      background: rgba(49, 181, 69, 0.18);
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+    .subtitle {
+      margin: 0 0 22px;
+      opacity: 0.72;
+      font-size: 0.95rem;
+      line-height: 1.4;
+    }
+    .phone {
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin-bottom: 28px;
+      word-break: break-word;
+    }
+    .call-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      max-width: 320px;
+      padding: 16px 20px;
+      border-radius: 14px;
+      background: #31b545;
+      color: #fff;
+      font-size: 1.05rem;
+      font-weight: 700;
+      text-decoration: none;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 10px 28px rgba(49, 181, 69, 0.28);
+    }
+    .hint {
+      margin-top: 18px;
+      font-size: 0.82rem;
+      opacity: 0.55;
+      max-width: 280px;
+      line-height: 1.35;
+    }
+  </style>
+</head>
+<body>
+  <div class="icon">📞</div>
+  <h1 id="title">Позвонить клиенту</h1>
+  <p class="subtitle" id="subtitle">Нажмите кнопку ниже — откроется набор номера</p>
+  <div class="phone" id="phone"></div>
+  <a class="call-btn" id="callBtn" href="#">Позвонить</a>
+  <p class="hint" id="hint">Если звонок не начался автоматически, нажмите зелёную кнопку ещё раз.</p>
+  <script>
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const lang = (params.get("lang") || "ru").slice(0, 2);
+      const raw = params.get("phone") || "";
+      const digits = raw.replace(/\D/g, "");
+      const e164 = digits ? "+" + digits : "";
+      const tg = window.Telegram && window.Telegram.WebApp;
+
+      const i18n = {
+        ru: {
+          title: "Позвонить клиенту",
+          subtitle: "Откроется набор номера в телефоне",
+          call: "Позвонить",
+          hint: "Если набор не открылся, нажмите кнопку ещё раз.",
+          main: "Позвонить клиенту",
+        },
+        en: {
+          title: "Call client",
+          subtitle: "Your phone dialer will open",
+          call: "Call",
+          hint: "If the dialer did not open, tap the button again.",
+          main: "Call client",
+        },
+        ka: {
+          title: "დარეკვა კლიენტთან",
+          subtitle: "გაიხსნება ტელეფონის აკრიფვა",
+          call: "დარეკვა",
+          hint: "თუ აკრიფვა არ გაიხსნა, კიდევ დააჭირეთ.",
+          main: "დარეკვა კლიენტთან",
+        },
+      };
+      const t = i18n[lang] || i18n.ru;
+
+      document.getElementById("title").textContent = t.title;
+      document.getElementById("subtitle").textContent = t.subtitle;
+      document.getElementById("hint").textContent = t.hint;
+      document.getElementById("phone").textContent = e164 || "—";
+      const callBtn = document.getElementById("callBtn");
+      callBtn.textContent = t.call;
+
+      function openDialer() {
+        if (!e164) return;
+        const url = "tel:" + e164;
+        try {
+          window.open(url, "_blank");
+        } catch (_) {}
+        window.location.href = url;
+      }
+
+      callBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        openDialer();
+      });
+      callBtn.href = e164 ? "tel:" + e164 : "#";
+
+      if (tg) {
+        tg.ready();
+        tg.expand();
+        tg.MainButton.setParams({ text: t.main, color: "#31b545", text_color: "#ffffff" });
+        tg.MainButton.show();
+        tg.MainButton.onClick(openDialer);
+        if (e164) {
+          setTimeout(openDialer, 120);
+        }
+      }
+    })();
+  </script>
+</body>
+</html>

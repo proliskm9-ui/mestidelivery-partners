@@ -1,8 +1,9 @@
-venv/
-__pycache__/
-*.pyc
-.env
+﻿.env*
+!.env.example
 *.db
-*.db-journal
-.vscode/
-.idea/
+*.log
+__pycache__/
+venv/
+node_modules/
+scratch/
+.DS_Store

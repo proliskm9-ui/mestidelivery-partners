@@ -16,15 +16,21 @@ from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 log = logging.getLogger("partners_bot.admin")
 
 ADMIN_ORDERS_PAGE = 8
 SLA_ACCEPT_MIN = 5  # ресторан ~5 мин на принятие
+SLA_ASSIGN_MIN = 5  # заказ без курьера
 SLA_READY_MIN = 15
 SLA_DELIVER_MIN = 10
 SLA_POLL_SEC = 90
+
+
+class AdminMessageState(StatesGroup):
+    waiting_text = State()
 
 ACTIVE_STATUSES = ("pending", "accepted", "preparing", "ready", "delivering")
 DONE_STATUSES = ("delivered", "cancelled")
@@ -131,7 +137,12 @@ def _status_label(status: str) -> str:
 def _overdue_label(flags: list[str]) -> str:
     if not flags:
         return ""
-    m = {"accept": "не принят", "ready": "не готов", "deliver": "не доставлен"}
+    m = {
+        "accept": "не принят",
+        "assign": "нет курьера",
+        "ready": "не готов",
+        "deliver": "не доставлен",
+    }
     parts = [m[f] for f in flags if f in m]
     return "⚠️ " + ", ".join(parts) if parts else "⚠️"
 
@@ -142,8 +153,21 @@ def _clip(text: str, limit: int = 3900) -> str:
     return text[: limit - 20].rstrip() + "\n…(обрезано)"
 
 
+# Владелец панели — только эти Telegram ID (не роль из auth.db)
+ADMIN_IDS = {5564438585}
+
+
 def _is_admin(tg_id: int) -> bool:
-    return tg_id == _admin_id()
+    tid = int(tg_id or 0)
+    return tid == _admin_id() or tid in ADMIN_IDS
+
+
+async def _is_admin_async(tg_id: int) -> bool:
+    return _is_admin(tg_id)
+
+
+def _ops():
+    return _deps.get("ops") or {}
 
 
 def _orders_where(filter_key: str) -> str:
@@ -173,7 +197,7 @@ def _count_overdue_active() -> int:
     conn = _connect(path)
     rows = conn.execute(
         f"""
-        SELECT status, created_at, restaurant_confirmed_at, courier_taken_at
+        SELECT status, created_at, restaurant_confirmed_at, courier_taken_at, courier_id
         FROM orders
         WHERE status IN ({','.join(repr(s) for s in ACTIVE_STATUSES)})
         """
@@ -185,27 +209,54 @@ def _count_overdue_active() -> int:
 # ── SQL / data ───────────────────────────────────────────────
 
 
+def _row_val(row: sqlite3.Row, key: str, default=None):
+    """Безопасный доступ к sqlite3.Row (IndexError при отсутствии ключа)."""
+    try:
+        if key in row.keys():
+            return row[key]
+    except Exception:
+        pass
+    return default
+
+
 def _order_overdue_flags(row: sqlite3.Row, now: datetime) -> list[str]:
     """Какие SLA-флаги горят для строки заказа."""
     flags: list[str] = []
-    st = (row["status"] or "").lower()
-    created = _parse_ts(row["created_at"])
-    confirmed = _parse_ts(row["restaurant_confirmed_at"] if "restaurant_confirmed_at" in row.keys() else None)
-    taken = _parse_ts(row["courier_taken_at"] if "courier_taken_at" in row.keys() else None)
+    st = (str(_row_val(row, "status") or "")).lower()
+    created = _parse_ts(_row_val(row, "created_at"))
+    confirmed = _parse_ts(_row_val(row, "restaurant_confirmed_at"))
+    taken = _parse_ts(_row_val(row, "courier_taken_at"))
 
     if st == "pending":
         age = _age_minutes(created, now)
         if age is not None and age >= SLA_ACCEPT_MIN:
             flags.append("accept")
+    if st in ("accepted", "preparing", "ready"):
+        try:
+            cid = int(_row_val(row, "courier_id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid <= 0:
+            base = confirmed or created
+            age = _age_minutes(base, now)
+            if age is not None and age >= SLA_ASSIGN_MIN:
+                flags.append("assign")
     if st in ("accepted", "preparing"):
-        base = confirmed or created
-        age = _age_minutes(base, now)
-        if age is not None and age >= SLA_READY_MIN:
-            flags.append("ready")
+        # Готовность считаем только от подтверждения рестораном.
+        if confirmed is None:
+            pass
+        else:
+            age = _age_minutes(confirmed, now)
+            if age is not None and age >= SLA_READY_MIN:
+                flags.append("ready")
     if st == "delivering":
-        age = _age_minutes(taken or created, now)
-        if age is not None and age >= SLA_DELIVER_MIN:
-            flags.append("deliver")
+        # Доставка — только от момента назначения курьера.
+        if taken is None:
+            pass
+        else:
+            age = _age_minutes(taken, now)
+            if age is not None and age >= SLA_DELIVER_MIN:
+                flags.append("deliver")
     return flags
 
 
@@ -619,11 +670,13 @@ def _query_courier_card(telegram_id: int) -> dict:
 # ── UI builders ──────────────────────────────────────────────
 
 
-def kb_home(*, pending_payouts: int = 0) -> InlineKeyboardMarkup:
+def kb_home(*, pending_payouts: int = 0, overdue_n: int = 0) -> InlineKeyboardMarkup:
     payout_label = "💳 Выплаты" if pending_payouts == 0 else f"💳 Выплаты ({pending_payouts})"
+    overdue_label = "⚠️ Внимание" if overdue_n == 0 else f"⚠️ Внимание ({overdue_n})"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh")],
+            [InlineKeyboardButton(text=overdue_label, callback_data="admin_overdue")],
             [
                 InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders"),
                 InlineKeyboardButton(text="🍽 Рестораны", callback_data="admin_restaurants"),
@@ -688,17 +741,65 @@ def kb_orders(filter_key: str, page: int, total: int, items: list[dict]) -> Inli
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_order_card(filter_key: str = "active", page: int = 0) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def kb_order_card(
+    order_id: int,
+    filter_key: str = "active",
+    page: int = 0,
+    *,
+    restaurant_tg: int = 0,
+    courier_tg: int = 0,
+    phone: str = "",
+    status: str = "",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    st = (status or "").lower()
+    active = st not in ("delivered", "cancelled", "canceled")
+    if active:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="← К заказам",
-                    callback_data=f"admin_orders_f_{filter_key}_{page}",
+                    text="📣 Пинг",
+                    callback_data=f"admin_oc_ping_{order_id}_{filter_key}_{page}",
+                ),
+                InlineKeyboardButton(
+                    text="📡 Реброадкаст",
+                    callback_data=f"admin_oc_rebcast_{order_id}_{filter_key}_{page}",
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить",
+                    callback_data=f"admin_oc_cancel_{order_id}_{filter_key}_{page}",
                 )
             ]
+        )
+    links = []
+    if restaurant_tg > 0:
+        links.append(
+            InlineKeyboardButton(text="🍽 Чат", url=f"tg://user?id={restaurant_tg}")
+        )
+    if courier_tg > 0:
+        links.append(
+            InlineKeyboardButton(text="🛵 Чат", url=f"tg://user?id={courier_tg}")
+        )
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits and len(digits) >= 9:
+        links.append(
+            InlineKeyboardButton(text="📞 Клиент", url=f"tg://resolve?phone={digits}")
+        )
+    if links:
+        rows.append(links[:3])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="← К заказам",
+                callback_data=f"admin_orders_f_{filter_key}_{page}",
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_restaurants(items: list[dict]) -> InlineKeyboardMarkup:
@@ -719,17 +820,35 @@ def kb_restaurants(items: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_restaurant_card() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="← К списку ресторанов", callback_data="admin_back_restaurants")]
-        ]
+def kb_restaurant_card(restaurant_id: str, *, is_open: bool = True, partner_tg: int = 0) -> InlineKeyboardMarkup:
+    rid = restaurant_id
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🔴 Закрыть" if is_open else "🟢 Открыть",
+                callback_data=f"admin_rc_toggle_{rid}",
+            )
+        ],
+        [
+            InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_rest_{rid}"),
+        ],
+    ]
+    if partner_tg > 0:
+        rows[-1].append(
+            InlineKeyboardButton(text="💬 Чат", url=f"tg://user?id={partner_tg}")
+        )
+    rows.append(
+        [InlineKeyboardButton(text="← К списку ресторанов", callback_data="admin_back_restaurants")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_couriers(items: list[dict]) -> InlineKeyboardMarkup:
+def kb_couriers(items: list[dict], *, online_only: bool = False) -> InlineKeyboardMarkup:
     rows = []
-    for c in items[:40]:
+    shown = items
+    if online_only:
+        shown = [c for c in items if c.get("is_online")]
+    for c in shown[:40]:
         mark = "🟢" if c["is_online"] else "🔴"
         act = c.get("active_order")
         suffix = f" · #{act['id']}" if act else ""
@@ -739,14 +858,63 @@ def kb_couriers(items: list[dict]) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(text=label, callback_data=f"admin_courier_{c['telegram_id']}")]
         )
+    filt = "online" if online_only else "all"
+    other = "all" if online_only else "online"
+    other_label = "Все" if online_only else "Только online"
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"Фильтр: {other_label}",
+                callback_data=f"admin_couriers_f_{other}",
+            )
+        ]
+    )
     rows.append([InlineKeyboardButton(text="← Назад", callback_data="admin_back_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_courier_card() -> InlineKeyboardMarkup:
+def kb_courier_card(telegram_id: int, *, is_online: bool = False, blocked: bool = False) -> InlineKeyboardMarkup:
+    tg = int(telegram_id)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_cour_{tg}"),
+            InlineKeyboardButton(text="💬 Чат", url=f"tg://user?id={tg}"),
+        ],
+    ]
+    if is_online:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⏹ Снять с линии",
+                    callback_data=f"admin_cc_offline_{tg}",
+                )
+            ]
+        )
+    if blocked:
+        rows.append(
+            [InlineKeyboardButton(text="✅ Снять блок", callback_data=f"admin_cc_unblock_{tg}")]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🚫 1ч", callback_data=f"admin_cc_block_{tg}_1"),
+                InlineKeyboardButton(text="🚫 24ч", callback_data=f"admin_cc_block_{tg}_24"),
+                InlineKeyboardButton(text="🚫 7д", callback_data=f"admin_cc_block_{tg}_168"),
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="← К списку курьеров", callback_data="admin_back_couriers")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_confirm(action: str, back_cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="← К списку курьеров", callback_data="admin_back_couriers")]
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin_yes_{action}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb),
+            ]
         ]
     )
 
@@ -785,7 +953,7 @@ async def build_home_text() -> tuple[str, int]:
         f'{_ce(E["balance"], "💰")} <b>Баланс сервиса</b>\n'
         f"Сегодня: <b>{_fmt_money(platform_today)} ₾</b>\n"
         f"Всего: <b>{_fmt_money(platform_lifetime)} ₾</b>\n"
-        f"<i>10% от позиций + сервисный сбор</i>\n\n"
+        f"<i>15% от позиций + сервисный сбор</i>\n\n"
         f'{_ce(E["btn_orders"], "📦")} <b>Заказы</b>\n'
         f"Активных: <b>{active_n}</b>\n"
         f"{overdue_line}\n"
@@ -828,14 +996,19 @@ def build_orders_text(filter_key: str, page: int) -> tuple[str, InlineKeyboardMa
 
 
 def build_order_card_text(
-    order_id: int, *, filter_key: str = "active", page: int = 0
+    order_id: int,
+    *,
+    filter_key: str = "active",
+    page: int = 0,
+    restaurant_tg: int = 0,
+    courier_tg: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
     o = _query_order_card(order_id)
     E = _E()
     if not o:
         return (
             f'{_ce(E["btn_orders"], "📦")} Заказ <b>#{order_id}</b> не найден.',
-            kb_order_card(filter_key, page),
+            kb_order_card(order_id, filter_key, page),
         )
     created = html.escape(str(o.get("created_at") or "—"))
     lines = [
@@ -859,7 +1032,15 @@ def build_order_card_text(
         lines.append(f"Взял: {html.escape(str(o['courier_taken_at']))}")
     if o.get("comment"):
         lines += ["", f"Комментарий: {html.escape(o['comment'][:200])}"]
-    return _clip("\n".join(lines)), kb_order_card(filter_key, page)
+    return _clip("\n".join(lines)), kb_order_card(
+        order_id,
+        filter_key,
+        page,
+        restaurant_tg=restaurant_tg,
+        courier_tg=courier_tg,
+        phone=str(o.get("phone") or ""),
+        status=str(o.get("status") or ""),
+    )
 
 
 def build_restaurants_text() -> tuple[str, InlineKeyboardMarkup]:
@@ -875,13 +1056,16 @@ def build_restaurants_text() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), kb_restaurants(items)
 
 
-def build_restaurant_card_text(restaurant_id: str) -> tuple[str, InlineKeyboardMarkup]:
+def build_restaurant_card_text(
+    restaurant_id: str, *, partner_tg: int = 0
+) -> tuple[str, InlineKeyboardMarkup]:
     c = _query_restaurant_card(restaurant_id)
     E = _E()
     st = "открыт" if c.get("is_open") else "закрыт"
     lines = [
         f'{_ce(E["restaurateur"], "🍽")} <b>{html.escape(c.get("name") or restaurant_id)}</b>',
         f"Статус: <b>{st}</b> · рейтинг: <b>{html.escape(str(c.get('rating') or '—'))}</b>",
+        f"ID: <code>{html.escape(restaurant_id)}</code>",
         "",
         f'{_ce(E["income_today"], "📈")} <b>Сегодня:</b> заказов {c.get("today_count", 0)}, '
         f"сумма {_fmt_money(c.get('today_sum', 0))} ₾",
@@ -896,31 +1080,40 @@ def build_restaurant_card_text(restaurant_id: str) -> tuple[str, InlineKeyboardM
             lines.append(
                 f"#{o['id']} · {_fmt_money(o['total'])} ₾ · {_status_label(o['status'])}"
             )
-    return "\n".join(lines), kb_restaurant_card()
+    return "\n".join(lines), kb_restaurant_card(
+        restaurant_id, is_open=bool(c.get("is_open")), partner_tg=partner_tg
+    )
 
 
-def build_couriers_text() -> tuple[str, InlineKeyboardMarkup]:
+def build_couriers_text(*, online_only: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     items = _query_couriers()
     E = _E()
     online = sum(1 for c in items if c["is_online"])
+    title = "Курьеры (online)" if online_only else "Курьеры"
     lines = [
-        f'{_ce(E["courier"], "🛵")} <b>Курьеры</b>',
+        f'{_ce(E["courier"], "🛵")} <b>{title}</b>',
         f"Всего: <b>{len(items)}</b> · на линии: <b>{online}</b>",
         "",
         "Выберите курьера:",
     ]
-    return "\n".join(lines), kb_couriers(items)
+    return "\n".join(lines), kb_couriers(items, online_only=online_only)
 
 
-def build_courier_card_text(telegram_id: int) -> tuple[str, InlineKeyboardMarkup]:
+def build_courier_card_text(
+    telegram_id: int, *, block: Optional[dict] = None
+) -> tuple[str, InlineKeyboardMarkup]:
     c = _query_courier_card(telegram_id)
     E = _E()
     st = "на линии" if c.get("is_online") else "офлайн"
     lines = [
         f'{_ce(E["courier"], "🛵")} <b>{html.escape(str(c.get("name") or telegram_id))}</b>',
+        f"TG: <code>{telegram_id}</code>",
         f"Статус: <b>{st}</b>",
-        "",
     ]
+    if block:
+        until_hm = datetime.fromtimestamp(float(block["until_ts"])).strftime("%d.%m %H:%M")
+        lines.append(f"⛔ <b>Блок до {until_hm}</b> · {html.escape(str(block.get('reason') or ''))}")
+    lines.append("")
     act = c.get("active_order")
     if act:
         lines.append(
@@ -942,7 +1135,11 @@ def build_courier_card_text(telegram_id: int) -> tuple[str, InlineKeyboardMarkup
             lines.append(
                 f"#{h['id']} · {_status_label(h['status'])} · доход {_fmt_money(h['earn'])} ₾"
             )
-    return "\n".join(lines), kb_courier_card()
+    return "\n".join(lines), kb_courier_card(
+        telegram_id,
+        is_online=bool(c.get("is_online")),
+        blocked=bool(block),
+    )
 
 
 # ── message edit helper / state ──────────────────────────────
@@ -1021,27 +1218,162 @@ async def render_admin(
 
 async def open_home(chat_id: int, message_id: Optional[int] = None) -> None:
     text, pending = await build_home_text()
+    overdue_n = await asyncio.to_thread(_count_overdue_active)
     await render_admin(
         chat_id,
         message_id=message_id,
         text=text,
-        keyboard=kb_home(pending_payouts=pending),
+        keyboard=kb_home(pending_payouts=pending, overdue_n=overdue_n),
     )
 
 
-# ── Handlers ─────────────────────────────────────────────────
+def build_overdue_text() -> tuple[str, InlineKeyboardMarkup]:
+    items = _scan_sla_candidates()
+    # unique orders
+    by_id: dict[int, dict] = {}
+    for it in items:
+        oid = int(it["order_id"])
+        if oid not in by_id:
+            by_id[oid] = it
+            by_id[oid]["flags"] = [it["type"]]
+        else:
+            by_id[oid]["flags"].append(it["type"])
+    E = _E()
+    lines = [
+        f'{_ce(E["profile_setup"], "⚠️")} <b>Нужно внимание</b>',
+        f"Просроченных заказов: <b>{len(by_id)}</b>",
+        "",
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    if not by_id:
+        lines.append("Сейчас всё спокойно.")
+    else:
+        for oid, it in sorted(by_id.items(), key=lambda x: -x[0])[:30]:
+            flags = _overdue_label(it.get("flags") or [it["type"]])
+            lines.append(
+                f"<b>#{oid}</b> {flags}\n"
+                f"{html.escape(str(it.get('restaurant') or '—'))} · "
+                f"{_status_label(it.get('status') or '')}"
+            )
+            rows.append(
+                [InlineKeyboardButton(text=f"#{oid}", callback_data=f"admin_order_{oid}")]
+            )
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="admin_back_home")])
+    return _clip("\n".join(lines)), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def register_admin_handlers(router: Router, **deps) -> None:
-    """deps: get_db, get_bot, admin_tg_id, order_db_paths, catalog_db_paths, auth_db_paths, partners_db_path, emoji"""
-    _deps.update(deps)
+async def _resolve_restaurant_tg(restaurant_id: str) -> int:
+    rid = str(restaurant_id or "").strip()
+    if not rid:
+        return 0
+    try:
+        partner = await _db().get_partner_by_restaurant(rid)
+        return int((partner or {}).get("telegram_id") or 0)
+    except Exception as e:
+        log.warning("resolve restaurant tg: %s", e)
+        return 0
+
+
+def _resolve_courier_tg(backend_courier_id: int) -> int:
+    cid = int(backend_courier_id or 0)
+    if cid <= 0:
+        return 0
+    for path in _auth_paths():
+        if not os.path.exists(path):
+            continue
+        try:
+            conn = _connect(path)
+            row = conn.execute(
+                "SELECT telegram_id FROM admin_users WHERE id = ? AND role = 'courier'",
+                (cid,),
+            ).fetchone()
+            conn.close()
+            if row and row["telegram_id"]:
+                return int(row["telegram_id"])
+        except Exception as e:
+            log.warning("resolve courier tg: %s", e)
+    return 0
+
+
+async def open_order_card(
+    chat_id: int,
+    message_id: Optional[int],
+    order_id: int,
+    *,
+    filter_key: str = "active",
+    page: int = 0,
+) -> None:
+    o = _query_order_card(order_id) or {}
+    rest_tg = await _resolve_restaurant_tg(str(o.get("restaurant_id") or ""))
+    cour_tg = _resolve_courier_tg(int(o.get("courier_id") or 0))
+    text, kb = build_order_card_text(
+        order_id,
+        filter_key=filter_key,
+        page=page,
+        restaurant_tg=rest_tg,
+        courier_tg=cour_tg,
+    )
+    await render_admin(chat_id, message_id=message_id, text=text, keyboard=kb)
+
+
+async def open_courier_card(
+    chat_id: int, message_id: Optional[int], telegram_id: int
+) -> None:
+    block = None
+    getter = _ops().get("get_courier_block")
+    if getter:
+        try:
+            block = await getter(int(telegram_id))
+        except Exception as e:
+            log.warning("get_courier_block: %s", e)
+    text, kb = build_courier_card_text(int(telegram_id), block=block)
+    await render_admin(chat_id, message_id=message_id, text=text, keyboard=kb)
+
+
+async def open_restaurant_card(
+    chat_id: int, message_id: Optional[int], restaurant_id: str
+) -> None:
+    partner_tg = await _resolve_restaurant_tg(restaurant_id)
+    text, kb = build_restaurant_card_text(restaurant_id, partner_tg=partner_tg)
+    await render_admin(chat_id, message_id=message_id, text=text, keyboard=kb)
+
+
+def register_admin_handlers(
+    router: Router,
+    *,
+    get_db: Callable,
+    get_bot: Callable,
+    admin_tg_id: int,
+    order_db_paths: list[str],
+    catalog_db_paths: list[str],
+    auth_db_paths: list[str],
+    partners_db_path: str,
+    emoji: dict,
+    open_payouts: Optional[Callable] = None,
+    is_super_admin: Optional[Callable] = None,
+    ops: Optional[dict] = None,
+) -> None:
+    _deps.update(
+        {
+            "get_db": get_db,
+            "get_bot": get_bot,
+            "admin_tg_id": admin_tg_id,
+            "order_db_paths": order_db_paths,
+            "catalog_db_paths": catalog_db_paths,
+            "auth_db_paths": auth_db_paths,
+            "partners_db_path": partners_db_path,
+            "emoji": emoji,
+            "open_payouts": open_payouts,
+            "is_super_admin": is_super_admin,
+            "ops": ops or {},
+        }
+    )
 
     @router.message(Command("admin"))
     async def cmd_admin(message: Message, state: FSMContext):
-        if not _is_admin(message.from_user.id):
+        if not await _is_admin_async(message.from_user.id):
             return
         await state.clear()
-        # не дублируем: пытаемся отредактировать сохранённое сообщение
         mid = await _get_panel_message_id(message.chat.id)
         await open_home(message.chat.id, message_id=mid)
         try:
@@ -1054,18 +1386,35 @@ def register_admin_handlers(router: Router, **deps) -> None:
         await callback.answer()
 
     @router.callback_query(F.data.in_({"admin_refresh", "admin_back_home"}))
-    async def on_home(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_home(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        await state.clear()
         await open_home(callback.message.chat.id, callback.message.message_id)
         await callback.answer("Обновлено" if callback.data == "admin_refresh" else "")
 
-    @router.callback_query(F.data == "admin_orders")
-    async def on_orders(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    @router.callback_query(F.data == "admin_overdue")
+    async def on_overdue(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        await state.clear()
+        text, kb = build_overdue_text()
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=text,
+            keyboard=kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "admin_orders")
+    async def on_orders(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.clear()
         text, kb = build_orders_text("active", 0)
         await render_admin(
             callback.message.chat.id,
@@ -1076,12 +1425,12 @@ def register_admin_handlers(router: Router, **deps) -> None:
         await callback.answer()
 
     @router.callback_query(F.data.regexp(r"^admin_orders_f_(active|done|all)_(\d+)$"))
-    async def on_orders_page(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_orders_page(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        await state.clear()
         parts = callback.data.split("_")
-        # admin_orders_f_{filter}_{page}
         filter_key = parts[3]
         page = int(parts[4])
         text, kb = build_orders_text(filter_key, page)
@@ -1094,38 +1443,99 @@ def register_admin_handlers(router: Router, **deps) -> None:
         await callback.answer()
 
     @router.callback_query(F.data.regexp(r"^admin_order_(\d+)$"))
-    async def on_order_card(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_order_card(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        await state.clear()
         oid = int(callback.data.split("_")[-1])
-        text, kb = build_order_card_text(oid, filter_key="active", page=0)
+        await open_order_card(
+            callback.message.chat.id,
+            callback.message.message_id,
+            oid,
+            filter_key="active",
+            page=0,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_oc_ping_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_ping(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, filter_key, page = int(parts[3]), parts[4], int(parts[5])
+        fn = _ops().get("ping_couriers")
+        if not fn:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        ok, msg = await fn(oid)
+        await callback.answer(msg[:180], show_alert=True)
+        await open_order_card(
+            callback.message.chat.id,
+            callback.message.message_id,
+            oid,
+            filter_key=filter_key,
+            page=page,
+        )
+
+    @router.callback_query(F.data.regexp(r"^admin_oc_rebcast_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_rebcast(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, filter_key, page = int(parts[3]), parts[4], int(parts[5])
+        fn = _ops().get("rebroadcast")
+        if not fn:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        ok, msg = await fn(oid)
+        await callback.answer(msg[:180], show_alert=True)
+        await open_order_card(
+            callback.message.chat.id,
+            callback.message.message_id,
+            oid,
+            filter_key=filter_key,
+            page=page,
+        )
+
+    @router.callback_query(F.data.regexp(r"^admin_oc_cancel_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_cancel_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, filter_key, page = int(parts[3]), parts[4], int(parts[5])
+        action = f"oc_cancel_{oid}_{filter_key}_{page}"
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
-            text=text,
-            keyboard=kb,
+            text=f"❌ Отменить заказ <b>#{oid}</b>?",
+            keyboard=kb_confirm(action, f"admin_order_{oid}"),
         )
         await callback.answer()
 
     @router.callback_query(F.data == "admin_payouts")
-    async def on_payouts(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_payouts(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        open_payouts = _deps.get("open_payouts")
-        if not open_payouts:
+        await state.clear()
+        open_payouts_fn = _deps.get("open_payouts")
+        if not open_payouts_fn:
             await callback.answer("Выплаты недоступны", show_alert=True)
             return
-        await open_payouts(callback.message.chat.id, callback.message.message_id)
+        await open_payouts_fn(callback.message.chat.id, callback.message.message_id)
         await callback.answer()
 
     @router.callback_query(F.data == "admin_restaurants")
     @router.callback_query(F.data == "admin_back_restaurants")
-    async def on_restaurants(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_restaurants(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        await state.clear()
         text, kb = build_restaurants_text()
         await render_admin(
             callback.message.chat.id,
@@ -1136,27 +1546,75 @@ def register_admin_handlers(router: Router, **deps) -> None:
         await callback.answer()
 
     @router.callback_query(F.data.startswith("admin_restaurant_"))
-    async def on_restaurant_card(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_restaurant_card(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
+        if callback.data.startswith("admin_restaurants"):
+            return
+        await state.clear()
         rid = callback.data[len("admin_restaurant_") :]
-        text, kb = build_restaurant_card_text(rid)
+        await open_restaurant_card(
+            callback.message.chat.id, callback.message.message_id, rid
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_rc_toggle_"))
+    async def on_restaurant_toggle_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_rc_toggle_") :]
+        card = _query_restaurant_card(rid)
+        want_open = not bool(card.get("is_open"))
+        verb = "открыть" if want_open else "закрыть"
+        action = f"rc_open_{rid}" if want_open else f"rc_close_{rid}"
+        name = html.escape(str(card.get("name") or rid))
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
-            text=text,
-            keyboard=kb,
+            text=f"Подтвердите: <b>{verb}</b> ресторан\n{name}",
+            keyboard=kb_confirm(action, f"admin_restaurant_{rid}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_msg_rest_"))
+    async def on_msg_rest(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_msg_rest_") :]
+        partner_tg = await _resolve_restaurant_tg(rid)
+        if partner_tg <= 0:
+            await callback.answer("Партнёр не привязан", show_alert=True)
+            return
+        await state.set_state(AdminMessageState.waiting_text)
+        await state.update_data(
+            target_tg=partner_tg,
+            back_cb=f"admin_restaurant_{rid}",
+            kind="restaurant",
+        )
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_restaurant_{rid}")]
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text="✉️ Введите сообщение партнёру ресторана:",
+            keyboard=cancel_kb,
         )
         await callback.answer()
 
     @router.callback_query(F.data == "admin_couriers")
     @router.callback_query(F.data == "admin_back_couriers")
-    async def on_couriers(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    async def on_couriers(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        text, kb = build_couriers_text()
+        await state.clear()
+        text, kb = build_couriers_text(online_only=False)
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
@@ -1165,17 +1623,14 @@ def register_admin_handlers(router: Router, **deps) -> None:
         )
         await callback.answer()
 
-    @router.callback_query(F.data.startswith("admin_courier_"))
-    async def on_courier_card(callback: CallbackQuery):
-        if not _is_admin(callback.from_user.id):
+    @router.callback_query(F.data.in_({"admin_couriers_f_online", "admin_couriers_f_all"}))
+    async def on_couriers_filter(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        try:
-            tg = int(callback.data[len("admin_courier_") :])
-        except ValueError:
-            await callback.answer("Некорректный id", show_alert=True)
-            return
-        text, kb = build_courier_card_text(tg)
+        await state.clear()
+        online_only = callback.data.endswith("_online")
+        text, kb = build_couriers_text(online_only=online_only)
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
@@ -1183,6 +1638,189 @@ def register_admin_handlers(router: Router, **deps) -> None:
             keyboard=kb,
         )
         await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_courier_(\d+)$"))
+    async def on_courier_card(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.clear()
+        tg = int(callback.data[len("admin_courier_") :])
+        await open_courier_card(
+            callback.message.chat.id, callback.message.message_id, tg
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_msg_cour_(\d+)$"))
+    async def on_msg_cour(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        await state.set_state(AdminMessageState.waiting_text)
+        await state.update_data(
+            target_tg=tg, back_cb=f"admin_courier_{tg}", kind="courier"
+        )
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_courier_{tg}")]
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text="✉️ Введите сообщение курьеру:",
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_cc_offline_(\d+)$"))
+    async def on_courier_offline_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f"⏹ Снять курьера <code>{tg}</code> с линии?",
+            keyboard=kb_confirm(f"cc_offline_{tg}", f"admin_courier_{tg}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_cc_block_(\d+)_(\d+)$"))
+    async def on_courier_block_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        tg, hours = int(parts[3]), int(parts[4])
+        label = {1: "1 час", 24: "24 часа", 168: "7 дней"}.get(hours, f"{hours}ч")
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f"🚫 Заблокировать курьера <code>{tg}</code> на <b>{label}</b>?",
+            keyboard=kb_confirm(f"cc_block_{tg}_{hours}", f"admin_courier_{tg}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_cc_unblock_(\d+)$"))
+    async def on_courier_unblock_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f"✅ Снять блок с курьера <code>{tg}</code>?",
+            keyboard=kb_confirm(f"cc_unblock_{tg}", f"admin_courier_{tg}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_yes_"))
+    async def on_confirm_yes(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        action = callback.data[len("admin_yes_") :]
+        ops = _ops()
+        chat_id = callback.message.chat.id
+        mid = callback.message.message_id
+
+        if action.startswith("oc_cancel_"):
+            parts = action.split("_")
+            oid, filter_key, page = int(parts[2]), parts[3], int(parts[4])
+            fn = ops.get("cancel_order")
+            if not fn:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            ok, msg = await fn(oid)
+            await callback.answer(msg[:180], show_alert=not ok)
+            await open_order_card(chat_id, mid, oid, filter_key=filter_key, page=page)
+            return
+
+        if action.startswith("cc_offline_"):
+            tg = int(action.split("_")[-1])
+            fn = ops.get("force_offline")
+            if not fn:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            ok, msg = await fn(tg)
+            await callback.answer(msg[:180], show_alert=not ok)
+            await open_courier_card(chat_id, mid, tg)
+            return
+
+        if action.startswith("cc_block_"):
+            parts = action.split("_")
+            tg, hours = int(parts[2]), int(parts[3])
+            fn = ops.get("block_courier")
+            if not fn:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            ok, msg = await fn(tg, hours, admin_id=callback.from_user.id)
+            await callback.answer(msg[:180], show_alert=not ok)
+            await open_courier_card(chat_id, mid, tg)
+            return
+
+        if action.startswith("cc_unblock_"):
+            tg = int(action.split("_")[-1])
+            fn = ops.get("unblock_courier")
+            if not fn:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            ok, msg = await fn(tg)
+            await callback.answer(msg[:180], show_alert=not ok)
+            await open_courier_card(chat_id, mid, tg)
+            return
+
+        if action.startswith("rc_open_") or action.startswith("rc_close_"):
+            want_open = action.startswith("rc_open_")
+            rid = action[len("rc_open_") if want_open else len("rc_close_") :]
+            fn = ops.get("set_restaurant_open")
+            if not fn:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            ok, msg = await fn(rid, want_open)
+            await callback.answer(msg[:180], show_alert=not ok)
+            await open_restaurant_card(chat_id, mid, rid)
+            return
+
+        await callback.answer("Неизвестное действие", show_alert=True)
+
+    @router.message(AdminMessageState.waiting_text)
+    async def on_admin_message_text(message: Message, state: FSMContext):
+        if not await _is_admin_async(message.from_user.id):
+            return
+        data = await state.get_data()
+        target_tg = int(data.get("target_tg") or 0)
+        back_cb = str(data.get("back_cb") or "admin_back_home")
+        await state.clear()
+        fn = _ops().get("send_message")
+        if not fn or target_tg <= 0:
+            await message.answer("Отправка недоступна")
+            return
+        ok, msg = await fn(target_tg, message.text or "")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        panel_mid = await _get_panel_message_id(message.chat.id)
+        if back_cb.startswith("admin_courier_"):
+            tg = int(back_cb[len("admin_courier_") :])
+            await open_courier_card(message.chat.id, panel_mid, tg)
+        elif back_cb.startswith("admin_restaurant_"):
+            rid = back_cb[len("admin_restaurant_") :]
+            await open_restaurant_card(message.chat.id, panel_mid, rid)
+        else:
+            await open_home(message.chat.id, message_id=panel_mid)
+        try:
+            await _bot().send_message(
+                message.chat.id,
+                ("✅ " if ok else "⚠️ ") + msg,
+            )
+        except Exception:
+            pass
 
 
 # ── SLA alerts ───────────────────────────────────────────────
@@ -1249,13 +1887,14 @@ def _format_sla_alert(item: dict) -> str:
     E = _E()
     titles = {
         "accept": "Ресторан не принял заказ (~5 мин)",
+        "assign": "Курьер не назначен (~5 мин)",
         "ready": "Заказ не готов к выдаче",
         "deliver": "Курьер не завершил доставку",
     }
     title = titles.get(item["type"], "Просрочка по заказу")
     who = (
         f"Ресторан: <b>{html.escape(item['restaurant'])}</b>"
-        if item["type"] in ("accept", "ready")
+        if item["type"] in ("accept", "ready", "assign")
         else f"Курьер: <b>{html.escape(str(item['courier']))}</b>"
     )
     return (
@@ -1283,10 +1922,22 @@ async def sla_watch_loop(stop_event: asyncio.Event) -> None:
                     continue
                 text = _format_sla_alert(item)
                 try:
+                    oid = int(item["order_id"])
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=f"Открыть #{oid}",
+                                    callback_data=f"admin_order_{oid}",
+                                )
+                            ]
+                        ]
+                    )
                     await _bot().send_message(
                         _admin_id(),
                         text,
                         parse_mode=ParseMode.HTML,
+                        reply_markup=kb,
                     )
                     await _mark_alert_sent(item["order_id"], item["type"])
                     log.info(
