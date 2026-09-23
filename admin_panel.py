@@ -9,6 +9,8 @@ import html
 import logging
 import os
 import sqlite3
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
@@ -17,7 +19,13 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 log = logging.getLogger("partners_bot.admin")
 
@@ -31,6 +39,23 @@ SLA_POLL_SEC = 90
 
 class AdminMessageState(StatesGroup):
     waiting_text = State()
+
+
+class AdminBroadcastState(StatesGroup):
+    waiting_text = State()
+    confirm = State()
+
+
+class AdminCourierEditState(StatesGroup):
+    waiting_data = State()
+
+
+class AdminRestEditAddrState(StatesGroup):
+    waiting_address = State()
+
+
+class AdminRestEditPhoneState(StatesGroup):
+    waiting_phone = State()
 
 ACTIVE_STATUSES = ("pending", "accepted", "preparing", "ready", "delivering")
 DONE_STATUSES = ("delivered", "cancelled")
@@ -153,17 +178,58 @@ def _clip(text: str, limit: int = 3900) -> str:
     return text[: limit - 20].rstrip() + "\n…(обрезано)"
 
 
-# Владелец панели — только эти Telegram ID (не роль из auth.db)
+# Владелец панели — Telegram ID администраторов
 ADMIN_IDS = {5564438585}
 
 
 def _is_admin(tg_id: int) -> bool:
     tid = int(tg_id or 0)
-    return tid == _admin_id() or tid in ADMIN_IDS
+    if not tid:
+        return False
+    if tid == _admin_id() or tid in ADMIN_IDS:
+        return True
+    # Проверка в auth.db
+    for path in _auth_paths():
+        if not os.path.exists(path):
+            continue
+        try:
+            conn = _connect(path)
+            row = conn.execute(
+                "SELECT role FROM admin_users WHERE telegram_id = ?",
+                (str(tid),),
+            ).fetchone()
+            conn.close()
+            if row and str(row["role"]).lower() in ("super_admin", "admin"):
+                return True
+        except Exception:
+            pass
+    # Проверка в partners_bot.db
+    pdb = _deps.get("partners_db_path")
+    if pdb and os.path.exists(pdb):
+        try:
+            conn = _connect(pdb)
+            row = conn.execute(
+                "SELECT role FROM bot_users WHERE telegram_id = ?",
+                (tid,),
+            ).fetchone()
+            conn.close()
+            if row and str(row["role"]).lower() in ("super_admin", "admin"):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 async def _is_admin_async(tg_id: int) -> bool:
-    return _is_admin(tg_id)
+    if _is_admin(tg_id):
+        return True
+    isa = _deps.get("is_super_admin")
+    if isa:
+        try:
+            return bool(await isa(tg_id))
+        except Exception:
+            pass
+    return False
 
 
 def _ops():
@@ -416,19 +482,24 @@ def _query_restaurants() -> list[dict]:
 
     conn = _connect(path_c)
     rows = conn.execute(
-        "SELECT id, name, is_active, rating FROM restaurants ORDER BY name COLLATE NOCASE"
+        "SELECT id, name, is_active, rating, address, phone FROM restaurants ORDER BY name COLLATE NOCASE"
     ).fetchall()
     conn.close()
 
-    # ui_is_open из partners (если есть)
+    # ui_is_open, telegram_id, registered_at из partners (если есть)
     ui_open: dict[str, Optional[int]] = {}
+    partner_tg_map: dict[str, int] = {}
+    partner_reg_map: dict[str, str] = {}
     try:
         # sync read через sqlite partners_bot — путь из deps
         pdb = _deps.get("partners_db_path")
         if pdb and os.path.exists(pdb):
             pc = _connect(pdb)
-            for r in pc.execute("SELECT restaurant_id, ui_is_open FROM partners"):
-                ui_open[str(r["restaurant_id"])] = r["ui_is_open"]
+            for r in pc.execute("SELECT restaurant_id, ui_is_open, telegram_id, registered_at FROM partners"):
+                rid_k = str(r["restaurant_id"])
+                ui_open[rid_k] = r["ui_is_open"]
+                partner_tg_map[rid_k] = int(r["telegram_id"] or 0)
+                partner_reg_map[rid_k] = str(r["registered_at"] or "")
             pc.close()
     except Exception:
         pass
@@ -439,13 +510,22 @@ def _query_restaurants() -> list[dict]:
         catalog_open = int(r["is_active"] or 0) == 1
         ui = ui_open.get(rid)
         is_open = catalog_open if ui is None else int(ui) == 1
+        tg_id = partner_tg_map.get(rid, 0)
+        keys = r.keys()
+        addr_val = (r["address"] or "").strip() if "address" in keys else ""
+        phone_val = (r["phone"] or "").strip() if "phone" in keys else ""
         out.append(
             {
                 "id": rid,
                 "name": r["name"] or rid,
                 "is_open": is_open,
                 "rating": r["rating"] or "—",
+                "address": addr_val,
+                "phone": phone_val,
                 "active_orders": active_counts.get(rid, 0),
+                "is_logged_in": tg_id > 0,
+                "telegram_id": tg_id,
+                "registered_at": partner_reg_map.get(rid, ""),
             }
         )
     return out
@@ -453,7 +533,33 @@ def _query_restaurants() -> list[dict]:
 
 def _query_restaurant_card(restaurant_id: str) -> dict:
     rests = {r["id"]: r for r in _query_restaurants()}
-    base = rests.get(restaurant_id, {"id": restaurant_id, "name": restaurant_id, "is_open": False, "rating": "—", "active_orders": 0})
+    base = rests.get(restaurant_id, {"id": restaurant_id, "name": restaurant_id, "is_open": False, "rating": "—", "address": "", "phone": "", "active_orders": 0, "is_logged_in": False, "telegram_id": 0, "registered_at": ""})
+    base = dict(base)
+
+    # Подтягиваем свежие данные из catalog.db (адрес, телефон, статус)
+    path_c = _first_existing(_catalog_paths())
+    if path_c:
+        try:
+            cc = _connect(path_c)
+            crow = cc.execute(
+                "SELECT name, is_active, rating, address, phone FROM restaurants WHERE id = ?",
+                (restaurant_id,),
+            ).fetchone()
+            if crow:
+                ckeys = crow.keys()
+                if crow["name"]:
+                    base["name"] = crow["name"]
+                if "address" in ckeys and crow["address"]:
+                    base["address"] = crow["address"].strip()
+                if "phone" in ckeys and crow["phone"]:
+                    base["phone"] = crow["phone"].strip()
+                if crow["rating"]:
+                    base["rating"] = crow["rating"]
+                base["is_open"] = int(crow["is_active"] or 0) == 1
+            cc.close()
+        except Exception as e:
+            log.warning("query restaurant card catalog: %s", e)
+
     path = _first_existing(_order_paths())
     active = []
     today_count = 0
@@ -482,10 +588,37 @@ def _query_restaurant_card(restaurant_id: str) -> dict:
         today_count = int(row["c"] or 0)
         today_sum = float(row["s"] or 0)
         conn.close()
-    base = dict(base)
     base["active_list"] = active
     base["today_count"] = today_count
     base["today_sum"] = today_sum
+
+    # Подтягиваем логин и данные из auth.db
+    partner_username = "—"
+    for a_path in _auth_paths():
+        if os.path.exists(a_path):
+            try:
+                ac = _connect(a_path)
+                a_row = ac.execute(
+                    "SELECT username, telegram_id, created_at, phone FROM admin_users WHERE restaurant_id = ? AND role = 'restaurant_admin'",
+                    (restaurant_id,)
+                ).fetchone()
+                if a_row:
+                    partner_username = a_row["username"] or "—"
+                    if "phone" in a_row.keys() and a_row["phone"] and not base.get("phone"):
+                        base["phone"] = a_row["phone"].strip()
+                    if not base.get("telegram_id") and a_row["telegram_id"]:
+                        try:
+                            base["telegram_id"] = int(a_row["telegram_id"])
+                            base["is_logged_in"] = True
+                        except Exception:
+                            pass
+                    if not base.get("registered_at") and a_row["created_at"]:
+                        base["registered_at"] = str(a_row["created_at"])
+                ac.close()
+            except Exception as e:
+                log.warning("auth restaurant info: %s", e)
+            break
+    base["username"] = partner_username
     return base
 
 
@@ -511,14 +644,20 @@ def _query_couriers() -> list[dict]:
     # статусы online из partners bot_users
     online_map: dict[int, int] = {}
     names: dict[int, str] = {}
+    phones: dict[int, str] = {}
     pdb = _deps.get("partners_db_path")
     if pdb and os.path.exists(pdb):
         pc = _connect(pdb)
         for r in pc.execute(
-            "SELECT telegram_id, backend_username, is_online FROM bot_users WHERE role = 'courier'"
+            "SELECT telegram_id, backend_username, is_online, name, phone FROM bot_users WHERE role = 'courier'"
         ):
-            online_map[int(r["telegram_id"])] = int(r["is_online"] or 0)
-            names[int(r["telegram_id"])] = r["backend_username"] or str(r["telegram_id"])
+            tid = int(r["telegram_id"])
+            online_map[tid] = int(r["is_online"] or 0)
+            keys = r.keys()
+            c_name = (r["name"] or "").strip() if "name" in keys else ""
+            c_phone = (r["phone"] or "").strip() if "phone" in keys else ""
+            names[tid] = c_name or r["backend_username"] or str(tid)
+            phones[tid] = c_phone
         pc.close()
 
     # активные заказы по courier_id
@@ -559,6 +698,7 @@ def _query_couriers() -> list[dict]:
                 "telegram_id": tg,
                 "backend_id": bid,
                 "name": names.get(tg) or meta["username"] or f"tg:{tg}",
+                "phone": phones.get(tg, ""),
                 "is_online": online_map.get(tg, 0) == 1,
                 "active_order": active_by_courier.get(bid),
             }
@@ -571,6 +711,7 @@ def _query_couriers() -> list[dict]:
                 "telegram_id": tg,
                 "backend_id": None,
                 "name": name,
+                "phone": phones.get(tg, ""),
                 "is_online": online_map.get(tg, 0) == 1,
                 "active_order": None,
             }
@@ -583,23 +724,49 @@ def _query_courier_card(telegram_id: int) -> dict:
     lst = {c["telegram_id"]: c for c in _query_couriers()}
     base = lst.get(
         telegram_id,
-        {"telegram_id": telegram_id, "backend_id": None, "name": f"tg:{telegram_id}", "is_online": False, "active_order": None},
+        {"telegram_id": telegram_id, "backend_id": None, "name": f"tg:{telegram_id}", "is_online": False, "active_order": None, "phone": "", "display_name": "", "username": ""},
     )
     base = dict(base)
+
+    # Проверяем bot_users (partners_bot.db)
+    pdb = _deps.get("partners_db_path")
+    if pdb and os.path.exists(pdb):
+        try:
+            pc = _connect(pdb)
+            r = pc.execute("SELECT name, phone, backend_username FROM bot_users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+            if r:
+                keys = r.keys()
+                if "phone" in keys and r["phone"]:
+                    base["phone"] = r["phone"].strip()
+                if "name" in keys and r["name"]:
+                    base["display_name"] = r["name"].strip()
+                if r["backend_username"]:
+                    base["username"] = r["backend_username"].strip()
+            pc.close()
+        except Exception:
+            pass
+
     backend_ids = []
     if base.get("backend_id"):
         backend_ids.append(int(base["backend_id"]))
-    # подтянуть все id из auth по telegram
+    # подтянуть все id из auth по telegram + телефон и имя
     for path in _auth_paths():
         if not os.path.exists(path):
             continue
         try:
             conn = _connect(path)
             for r in conn.execute(
-                "SELECT id FROM admin_users WHERE telegram_id = ? AND role = 'courier'",
+                "SELECT id, full_name, phone, username FROM admin_users WHERE telegram_id = ? AND role = 'courier'",
                 (str(telegram_id),),
             ):
                 backend_ids.append(int(r["id"]))
+                keys = r.keys()
+                if not base.get("phone") and "phone" in keys and r["phone"]:
+                    base["phone"] = r["phone"].strip()
+                if not base.get("display_name") and "full_name" in keys and r["full_name"]:
+                    base["display_name"] = r["full_name"].strip()
+                if not base.get("username") and r["username"]:
+                    base["username"] = r["username"].strip()
             conn.close()
         except Exception:
             pass
@@ -685,6 +852,10 @@ def kb_home(*, pending_payouts: int = 0, overdue_n: int = 0) -> InlineKeyboardMa
                 InlineKeyboardButton(text="🛵 Курьеры", callback_data="admin_couriers"),
                 InlineKeyboardButton(text=payout_label, callback_data="admin_payouts"),
             ],
+            [
+                InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"),
+                InlineKeyboardButton(text="📊 Экспорт CSV", callback_data="admin_export_csv"),
+            ],
         ]
     )
 
@@ -737,6 +908,7 @@ def kb_orders(filter_key: str, page: int, total: int, items: list[dict]) -> Inli
             InlineKeyboardButton(text="▶️", callback_data=f"admin_orders_f_{filter_key}_{page + 1}")
         )
     rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🧹 Очистка заказов", callback_data="admin_orders_cleanup_menu")])
     rows.append([InlineKeyboardButton(text="← Назад", callback_data="admin_back_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -758,6 +930,14 @@ def kb_order_card(
         rows.append(
             [
                 InlineKeyboardButton(
+                    text="🎯 Назначить курьера",
+                    callback_data=f"admin_oc_choose_cour_{order_id}_{filter_key}_{page}",
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
                     text="📣 Пинг",
                     callback_data=f"admin_oc_ping_{order_id}_{filter_key}_{page}",
                 ),
@@ -775,22 +955,20 @@ def kb_order_card(
                 )
             ]
         )
-    links = []
-    if restaurant_tg > 0:
-        links.append(
-            InlineKeyboardButton(text="🍽 Чат", url=f"tg://user?id={restaurant_tg}")
-        )
-    if courier_tg > 0:
-        links.append(
-            InlineKeyboardButton(text="🛵 Чат", url=f"tg://user?id={courier_tg}")
-        )
+    # Кнопка удаления заказа из базы с очисткой сообщений
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить заказ",
+                callback_data=f"admin_oc_del_{order_id}_{filter_key}_{page}",
+            )
+        ]
+    )
     digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
     if digits and len(digits) >= 9:
-        links.append(
-            InlineKeyboardButton(text="📞 Клиент", url=f"tg://resolve?phone={digits}")
+        rows.append(
+            [InlineKeyboardButton(text="📞 Позвонить клиенту", url=f"tg://resolve?phone={digits}")]
         )
-    if links:
-        rows.append(links[:3])
     rows.append(
         [
             InlineKeyboardButton(
@@ -806,9 +984,10 @@ def kb_restaurants(items: list[dict]) -> InlineKeyboardMarkup:
     rows = []
     for r in items[:40]:
         mark = "🟢" if r["is_open"] else "🔴"
+        auth_badge = "📱" if r.get("is_logged_in") else "⚪"
         act = r.get("active_orders") or 0
-        suffix = f" · {act}" if act else ""
-        label = f"{mark} {r['name']}{suffix}"
+        suffix = f" · 📦{act}" if act else ""
+        label = f"{mark} {auth_badge} {r['name']}{suffix}"
         if len(label) > 60:
             label = label[:57] + "…"
         cb = f"admin_restaurant_{r['id']}"
@@ -825,17 +1004,33 @@ def kb_restaurant_card(restaurant_id: str, *, is_open: bool = True, partner_tg: 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="🔴 Закрыть" if is_open else "🟢 Открыть",
+                text="🔴 Закрыть прием" if is_open else "🟢 Открыть прием",
                 callback_data=f"admin_rc_toggle_{rid}",
             )
         ],
         [
-            InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_rest_{rid}"),
+            InlineKeyboardButton(text="📍 Изменить адрес", callback_data=f"admin_rest_edit_addr_{rid}"),
+            InlineKeyboardButton(text="📞 Телефон", callback_data=f"admin_rest_edit_phone_{rid}"),
         ],
     ]
     if partner_tg > 0:
-        rows[-1].append(
-            InlineKeyboardButton(text="💬 Чат", url=f"tg://user?id={partner_tg}")
+        rows.append(
+            [
+                InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_rest_{rid}"),
+                InlineKeyboardButton(text="🛠 Тех. уведомление", callback_data=f"admin_tech_rest_{rid}"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(text="🌐 Сменить язык", callback_data=f"admin_chg_lang_rest_{rid}"),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_rest_{rid}"),
+                InlineKeyboardButton(text="🛠 Тех. уведомление", callback_data=f"admin_tech_rest_{rid}"),
+            ]
         )
     rows.append(
         [InlineKeyboardButton(text="← К списку ресторанов", callback_data="admin_back_restaurants")]
@@ -877,8 +1072,14 @@ def kb_courier_card(telegram_id: int, *, is_online: bool = False, blocked: bool 
     tg = int(telegram_id)
     rows: list[list[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(text="📞 Задать телефон / имя", callback_data=f"admin_cour_edit_{tg}"),
+        ],
+        [
             InlineKeyboardButton(text="✉️ Написать", callback_data=f"admin_msg_cour_{tg}"),
-            InlineKeyboardButton(text="💬 Чат", url=f"tg://user?id={tg}"),
+            InlineKeyboardButton(text="🛠 Тех. уведомление", callback_data=f"admin_tech_cour_{tg}"),
+        ],
+        [
+            InlineKeyboardButton(text="🌐 Сменить язык", callback_data=f"admin_chg_lang_cour_{tg}"),
         ],
     ]
     if is_online:
@@ -1047,11 +1248,16 @@ def build_restaurants_text() -> tuple[str, InlineKeyboardMarkup]:
     items = _query_restaurants()
     E = _E()
     open_n = sum(1 for r in items if r["is_open"])
+    auth_n = sum(1 for r in items if r.get("is_logged_in"))
     lines = [
-        f'{_ce(E["restaurateur"], "🍽")} <b>Рестораны</b>',
-        f"Всего: <b>{len(items)}</b> · открыто: <b>{open_n}</b>",
+        f'{_ce(E["restaurateur"], "🍽")} <b>Рестораны-партнёры</b>',
+        f"Всего: <b>{len(items)}</b> · Открыто: <b>{open_n}</b> · В боте: <b>{auth_n}</b>",
         "",
-        "Выберите ресторан:",
+        "<i>Обозначения:</i>",
+        "🟢/🔴 — кухня (открыт / закрыт)",
+        "📱 — авторизован в боте | ⚪ — не заходил",
+        "",
+        "Выберите ресторан для просмотра деталей и связи:",
     ]
     return "\n".join(lines), kb_restaurants(items)
 
@@ -1061,11 +1267,47 @@ def build_restaurant_card_text(
 ) -> tuple[str, InlineKeyboardMarkup]:
     c = _query_restaurant_card(restaurant_id)
     E = _E()
-    st = "открыт" if c.get("is_open") else "закрыт"
+    st = "🟢 Открыт" if c.get("is_open") else "🔴 Закрыт"
+
+    tg_id = partner_tg or c.get("telegram_id") or 0
+    username = c.get("username") or "—"
+    reg_date = c.get("registered_at") or "—"
+
+    rest_lang_code = "ka"
+    if tg_id > 0:
+        pdb = _deps.get("partners_db_path")
+        if pdb and os.path.exists(pdb):
+            try:
+                conn = _connect(pdb)
+                row = conn.execute("SELECT language FROM bot_users WHERE telegram_id = ?", (tg_id,)).fetchone()
+                if row and row["language"]:
+                    rest_lang_code = row["language"]
+                conn.close()
+            except Exception:
+                pass
+    lang_names = {"ka": "🇬🇪 ქართული", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+    rest_lang_label = lang_names.get(rest_lang_code, rest_lang_code.upper())
+
+    if tg_id > 0:
+        bot_auth_status = f"🟢 <b>Авторизован в Telegram</b> (ID: <code>{tg_id}</code>)"
+        auth_details = f"Логин: <code>{html.escape(username)}</code>\n• Привязка к боту: <code>{reg_date}</code>\n• Язык в боте: <b>{rest_lang_label}</b>"
+    else:
+        bot_auth_status = "⚪ <b>Не авторизован в боте</b>"
+        auth_details = f"Логин в системе: <code>{html.escape(username)}</code> (ожидает входа)"
+
+    addr_str = c.get("address") or "— не указан —"
+    phone_str = c.get("phone") or "— не указан —"
+
     lines = [
         f'{_ce(E["restaurateur"], "🍽")} <b>{html.escape(c.get("name") or restaurant_id)}</b>',
-        f"Статус: <b>{st}</b> · рейтинг: <b>{html.escape(str(c.get('rating') or '—'))}</b>",
-        f"ID: <code>{html.escape(restaurant_id)}</code>",
+        f"📍 Адрес для забора: <b>{html.escape(addr_str)}</b>",
+        f"📞 Телефон заведения: <b>{html.escape(phone_str)}</b>",
+        f"Статус кухни: <b>{st}</b> · Рейтинг: <b>{html.escape(str(c.get('rating') or '—'))}</b>",
+        f"ID заведения: <code>{html.escape(restaurant_id)}</code>",
+        "",
+        f'{_ce(E["profile_setup"], "🔑")} <b>Учётная запись партнёра:</b>',
+        f"• Статус: {bot_auth_status}",
+        f"• {auth_details}",
         "",
         f'{_ce(E["income_today"], "📈")} <b>Сегодня:</b> заказов {c.get("today_count", 0)}, '
         f"сумма {_fmt_money(c.get('today_sum', 0))} ₾",
@@ -1081,7 +1323,7 @@ def build_restaurant_card_text(
                 f"#{o['id']} · {_fmt_money(o['total'])} ₾ · {_status_label(o['status'])}"
             )
     return "\n".join(lines), kb_restaurant_card(
-        restaurant_id, is_open=bool(c.get("is_open")), partner_tg=partner_tg
+        restaurant_id, is_open=bool(c.get("is_open")), partner_tg=tg_id
     )
 
 
@@ -1105,10 +1347,31 @@ def build_courier_card_text(
     c = _query_courier_card(telegram_id)
     E = _E()
     st = "на линии" if c.get("is_online") else "офлайн"
+
+    cour_lang_code = "ka"
+    pdb = _deps.get("partners_db_path")
+    if pdb and os.path.exists(pdb):
+        try:
+            conn = _connect(pdb)
+            row = conn.execute("SELECT language FROM bot_users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+            if row and row["language"]:
+                cour_lang_code = row["language"]
+            conn.close()
+        except Exception:
+            pass
+    lang_names = {"ka": "🇬🇪 ქართული", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+    cour_lang_label = lang_names.get(cour_lang_code, cour_lang_code.upper())
+
+    display_name = c.get("display_name") or c.get("name") or str(telegram_id)
+    username_part = f" (@{c['username']})" if c.get("username") else ""
+    phone_str = c.get("phone") or "— не указан —"
+
     lines = [
-        f'{_ce(E["courier"], "🛵")} <b>{html.escape(str(c.get("name") or telegram_id))}</b>',
+        f'{_ce(E["courier"], "🛵")} <b>{html.escape(display_name)}{username_part}</b>',
         f"TG: <code>{telegram_id}</code>",
         f"Статус: <b>{st}</b>",
+        f"📞 Телефон для заведений: <b>{html.escape(phone_str)}</b>",
+        f"Язык в боте: <b>{cour_lang_label}</b>",
     ]
     if block:
         until_hm = datetime.fromtimestamp(float(block["until_ts"])).strftime("%d.%m %H:%M")
@@ -1185,25 +1448,22 @@ async def render_admin(
 ) -> int:
     bot = _bot()
     text = _clip(text)
-    target_id = message_id
-    if target_id is None:
-        target_id = await _get_panel_message_id(chat_id)
 
-    if target_id:
+    if message_id:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=target_id,
+                message_id=message_id,
                 text=text,
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
             )
-            await _save_panel_message(chat_id, target_id)
-            return target_id
+            await _save_panel_message(chat_id, message_id)
+            return message_id
         except Exception as e:
             err = str(e).lower()
             if "message is not modified" in err:
-                return target_id
+                return message_id
             log.warning("admin edit failed (%s) — send new", e)
 
     msg = await bot.send_message(
@@ -1295,6 +1555,93 @@ def _resolve_courier_tg(backend_courier_id: int) -> int:
     return 0
 
 
+def _generate_orders_csv(period: str) -> str:
+    path = _first_existing(_order_paths())
+    if not path:
+        return ""
+    names = _load_restaurant_names()
+    couriers = _load_courier_names()
+
+    where = "1=1"
+    if period == "today":
+        where = "date(replace(substr(created_at, 1, 10), 'T', ' ')) = date('now')"
+    elif period == "week":
+        where = "date(replace(substr(created_at, 1, 10), 'T', ' ')) >= date('now', '-7 days')"
+
+    conn = _connect(path)
+    rows = conn.execute(
+        f"""
+        SELECT id, created_at, restaurant_id, courier_id, total, delivery_fee,
+               service_fee, tips, status, payment_method, customer_name, phone, address
+        FROM orders
+        WHERE {where}
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow([
+        "ID заказа", "Дата и время", "Ресторан", "Курьер", "Сумма заказа (GEL)",
+        "Сумма позиций (GEL)", "Доход ресторана 90% (GEL)", "Комиссия сервиса 10% (GEL)",
+        "Сервисный сбор (GEL)", "Доход курьера (GEL)", "Чаевые (GEL)", "Статус",
+        "Оплата", "Клиент", "Телефон", "Адрес доставки"
+    ])
+
+    for r in rows:
+        tot = float(r["total"] or 0)
+        deliv = float(r["delivery_fee"] or 0)
+        srv = float(r["service_fee"] or 0)
+        tips = float(r["tips"] or 0)
+        items_total = max(0.0, tot - deliv - srv - tips)
+        rest_income = items_total * 0.90
+        plat_commission = items_total * 0.10
+        courier_earn = deliv + tips
+
+        rid = str(r["restaurant_id"] or "")
+        rest_name = names.get(rid, rid)
+        cid = int(r["courier_id"] or 0)
+        courier_name = couriers.get(cid, "—") if cid else "—"
+
+        writer.writerow([
+            r["id"],
+            r["created_at"],
+            rest_name,
+            courier_name,
+            f"{tot:.2f}",
+            f"{items_total:.2f}",
+            f"{rest_income:.2f}",
+            f"{plat_commission:.2f}",
+            f"{srv:.2f}",
+            f"{courier_earn:.2f}",
+            f"{tips:.2f}",
+            r["status"],
+            r["payment_method"],
+            r["customer_name"],
+            r["phone"],
+            r["address"]
+        ])
+    return output.getvalue()
+
+
+def _get_broadcast_recipients(target: str) -> list[int]:
+    tids = set()
+    pdb = _deps.get("partners_db_path")
+    if pdb and os.path.exists(pdb):
+        conn = _connect(pdb)
+        if target in ("rest", "all"):
+            for r in conn.execute("SELECT telegram_id FROM partners WHERE telegram_id > 0"):
+                tids.add(int(r["telegram_id"]))
+            for r in conn.execute("SELECT telegram_id FROM bot_users WHERE role = 'restaurant_admin' AND telegram_id > 0"):
+                tids.add(int(r["telegram_id"]))
+        if target in ("cour", "all"):
+            for r in conn.execute("SELECT telegram_id FROM bot_users WHERE role = 'courier' AND telegram_id > 0"):
+                tids.add(int(r["telegram_id"]))
+        conn.close()
+    return list(tids)
+
+
 async def open_order_card(
     chat_id: int,
     message_id: Optional[int],
@@ -1372,14 +1719,16 @@ def register_admin_handlers(
     @router.message(Command("admin"))
     async def cmd_admin(message: Message, state: FSMContext):
         if not await _is_admin_async(message.from_user.id):
+            log.warning("Unauthorized /admin attempt: user_id=%d, username=%s", message.from_user.id, message.from_user.username)
+            await message.answer(
+                f"⛔ <b>Панель администратора</b>\n\n"
+                f"У вас нет прав доступа к панели.\n"
+                f"Ваш Telegram ID: <code>{message.from_user.id}</code>",
+                parse_mode=ParseMode.HTML,
+            )
             return
         await state.clear()
-        mid = await _get_panel_message_id(message.chat.id)
-        await open_home(message.chat.id, message_id=mid)
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await open_home(message.chat.id, message_id=None)
 
     @router.callback_query(F.data == "admin_noop")
     async def on_noop(callback: CallbackQuery):
@@ -1500,6 +1849,67 @@ def register_admin_handlers(
             page=page,
         )
 
+    @router.callback_query(F.data.regexp(r"^admin_oc_choose_cour_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_assign_choose(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, filter_key, page = int(parts[4]), parts[5], int(parts[6])
+        couriers = _query_couriers()
+        rows = []
+        for c in couriers[:25]:
+            mark = "🟢" if c["is_online"] else "⚪"
+            act = c.get("active_order")
+            suffix = f" · #{act['id']}" if act else ""
+            tg = c["telegram_id"] or 0
+            if tg <= 0:
+                continue
+            label = f"{mark} {c['name']}{suffix}"
+            if len(label) > 35:
+                label = label[:32] + "…"
+            rows.append([
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"admin_oc_do_assign_{oid}_{tg}_{filter_key}_{page}"
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"admin_order_{oid}"
+            )
+        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f"🎯 Выберите курьера для назначения на заказ <b>#{oid}</b>:",
+            keyboard=kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_oc_do_assign_(\d+)_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_assign_do(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, courier_tg, filter_key, page = int(parts[4]), int(parts[5]), parts[6], int(parts[7])
+        fn = _ops().get("assign_courier")
+        if not fn:
+            await callback.answer("Назначение недоступно", show_alert=True)
+            return
+        ok, msg = await fn(oid, courier_tg)
+        await callback.answer(msg[:180], show_alert=True)
+        await open_order_card(
+            callback.message.chat.id,
+            callback.message.message_id,
+            oid,
+            filter_key=filter_key,
+            page=page,
+        )
+
     @router.callback_query(F.data.regexp(r"^admin_oc_cancel_(\d+)_(active|done|all)_(\d+)$"))
     async def on_order_cancel_ask(callback: CallbackQuery):
         if not await _is_admin_async(callback.from_user.id):
@@ -1513,6 +1923,74 @@ def register_admin_handlers(
             message_id=callback.message.message_id,
             text=f"❌ Отменить заказ <b>#{oid}</b>?",
             keyboard=kb_confirm(action, f"admin_order_{oid}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_oc_del_(\d+)_(active|done|all)_(\d+)$"))
+    async def on_order_delete_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        oid, filter_key, page = int(parts[3]), parts[4], int(parts[5])
+        action = f"oc_del_{oid}_{filter_key}_{page}"
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=(
+                f"🗑 <b>Удалить заказ #{oid}?</b>\n\n"
+                f"Заказ будет полностью стёрт из базы данных.\n"
+                f"Также бот автоматически <b>удалит все связанные сообщения и напоминания из Telegram</b> "
+                f"(включая «Внимание: Заказ ожидает назначения», оповещения курьеров и алерты админа)."
+            ),
+            keyboard=kb_confirm(action, f"admin_order_{oid}"),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "admin_orders_cleanup_menu")
+    async def on_orders_cleanup_menu(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🧪 Удалить тестовые заказы (test_rest)", callback_data="admin_oc_bulk_ask_test")],
+                [InlineKeyboardButton(text="⏱ Удалить заказы за последний 1 час", callback_data="admin_oc_bulk_ask_1h")],
+                [InlineKeyboardButton(text="❌ Удалить все отменённые заказы", callback_data="admin_oc_bulk_ask_cancelled")],
+                [InlineKeyboardButton(text="← К заказам", callback_data="admin_orders")],
+            ]
+        )
+        text = (
+            "🧹 <b>Очистка и удаление заказов</b>\n\n"
+            "При удалении заказов из базы данных бот также <b>полностью удаляет из Telegram</b> "
+            "все связанные сообщения: карточки заказов у курьеров и ресторанов, напоминания "
+            "«Заказ ожидает назначения» и SLA-алерты админа.\n\n"
+            "Выберите вариант очистки:"
+        )
+        await render_admin(callback.message.chat.id, message_id=callback.message.message_id, text=text, keyboard=kb)
+        await callback.answer()
+
+    @router.callback_query(F.data.in_({"admin_oc_bulk_ask_test", "admin_oc_bulk_ask_1h", "admin_oc_bulk_ask_cancelled"}))
+    async def on_orders_bulk_ask(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        mode = callback.data.replace("admin_oc_bulk_ask_", "")
+        titles = {
+            "test": "тестовые заказы (ресторан test_rest_01 / demo)",
+            "1h": "все заказы за последний 1 час",
+            "cancelled": "все отменённые заказы",
+        }
+        text = (
+            f"⚠️ <b>Подтверждение очистки</b>\n\n"
+            f"Вы действительно хотите удалить {titles.get(mode, mode)}?\n\n"
+            f"Заказы будут стёрты из базы данных, а все связанные сообщения и напоминания полностью удалены из чатов Telegram."
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=text,
+            keyboard=kb_confirm(f"oc_bulk_{mode}", "admin_orders_cleanup_menu"),
         )
         await callback.answer()
 
@@ -1593,6 +2071,7 @@ def register_admin_handlers(
             target_tg=partner_tg,
             back_cb=f"admin_restaurant_{rid}",
             kind="restaurant",
+            msg_type="general",
         )
         cancel_kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1602,7 +2081,96 @@ def register_admin_handlers(
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
-            text="✉️ Введите сообщение партнёру ресторана:",
+            text="✉️ Введите сообщение ресторану (заголовок «Сообщение от платформы»):",
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_tech_rest_"))
+    async def on_tech_msg_rest(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_tech_rest_") :]
+        partner_tg = await _resolve_restaurant_tg(rid)
+        if partner_tg <= 0:
+            await callback.answer("Партнёр не привязан", show_alert=True)
+            return
+        await state.set_state(AdminMessageState.waiting_text)
+        await state.update_data(
+            target_tg=partner_tg,
+            back_cb=f"admin_restaurant_{rid}",
+            kind="restaurant",
+            msg_type="tech",
+        )
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_restaurant_{rid}")]
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text="🛠 Введите текст технического уведомления (заголовок «Техническое уведомление»):",
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_rest_edit_addr_"))
+    async def on_rest_edit_addr_ask(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_rest_edit_addr_") :]
+        c = _query_restaurant_card(rid)
+        cur_addr = c.get("address") or "— не указан —"
+        name = c.get("name") or rid
+        await state.set_state(AdminRestEditAddrState.waiting_address)
+        await state.update_data(restaurant_id=rid, back_cb=f"admin_restaurant_{rid}")
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_restaurant_{rid}")]
+            ]
+        )
+        text = (
+            f"📍 <b>Изменение адреса заведения {html.escape(name)}:</b>\n\n"
+            f"Текущий адрес:\n<code>{html.escape(cur_addr)}</code>\n\n"
+            f"Отправьте сообщением новый адрес ресторана.\n"
+            f"<i>Этот адрес будет передаваться курьеру для забора заказа.</i>"
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=text,
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin_rest_edit_phone_"))
+    async def on_rest_edit_phone_ask(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_rest_edit_phone_") :]
+        c = _query_restaurant_card(rid)
+        cur_phone = c.get("phone") or "— не указан —"
+        name = c.get("name") or rid
+        await state.set_state(AdminRestEditPhoneState.waiting_phone)
+        await state.update_data(restaurant_id=rid, back_cb=f"admin_restaurant_{rid}")
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_restaurant_{rid}")]
+            ]
+        )
+        text = (
+            f"📞 <b>Изменение телефона ресторана {html.escape(name)}:</b>\n\n"
+            f"Текущий телефон: <b>{html.escape(cur_phone)}</b>\n\n"
+            f"Отправьте сообщением контактный номер телефона заведения."
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=text,
             keyboard=cancel_kb,
         )
         await callback.answer()
@@ -1651,6 +2219,40 @@ def register_admin_handlers(
         )
         await callback.answer()
 
+    @router.callback_query(F.data.regexp(r"^admin_cour_edit_(\d+)$"))
+    async def on_courier_edit_ask(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        c = _query_courier_card(tg)
+        name = c.get("display_name") or c.get("name") or str(tg)
+        cur_phone = c.get("phone") or "— не указан —"
+        await state.set_state(AdminCourierEditState.waiting_data)
+        await state.update_data(target_tg=tg, back_cb=f"admin_courier_{tg}")
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_courier_{tg}")]
+            ]
+        )
+        text = (
+            f"✏️ <b>Настройка курьера {html.escape(name)}</b> (TG: <code>{tg}</code>)\n\n"
+            f"Текущий телефон: <b>{html.escape(cur_phone)}</b>\n\n"
+            f"Отправьте имя и/или телефон курьера для ресторанов.\n\n"
+            f"<b>Примеры ввода:</b>\n"
+            f"• <code>+995599123456</code> (только телефон)\n"
+            f"• <code>Георгий, +995599123456</code> (имя и телефон)\n"
+            f"• <code>Георгий</code> (только имя)\n\n"
+            f"<i>Эти данные отправляются заведениям при назначении на заказ.</i>"
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=text,
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
     @router.callback_query(F.data.regexp(r"^admin_msg_cour_(\d+)$"))
     async def on_msg_cour(callback: CallbackQuery, state: FSMContext):
         if not await _is_admin_async(callback.from_user.id):
@@ -1659,7 +2261,7 @@ def register_admin_handlers(
         tg = int(callback.data.split("_")[-1])
         await state.set_state(AdminMessageState.waiting_text)
         await state.update_data(
-            target_tg=tg, back_cb=f"admin_courier_{tg}", kind="courier"
+            target_tg=tg, back_cb=f"admin_courier_{tg}", kind="courier", msg_type="general"
         )
         cancel_kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1669,7 +2271,30 @@ def register_admin_handlers(
         await render_admin(
             callback.message.chat.id,
             message_id=callback.message.message_id,
-            text="✉️ Введите сообщение курьеру:",
+            text="✉️ Введите сообщение курьеру (заголовок «Сообщение от платформы»):",
+            keyboard=cancel_kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_tech_cour_(\d+)$"))
+    async def on_tech_msg_cour(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        await state.set_state(AdminMessageState.waiting_text)
+        await state.update_data(
+            target_tg=tg, back_cb=f"admin_courier_{tg}", kind="courier", msg_type="tech"
+        )
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_courier_{tg}")]
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text="🛠 Введите текст технического уведомления курьеру (заголовок «Техническое уведомление»):",
             keyboard=cancel_kb,
         )
         await callback.answer()
@@ -1788,6 +2413,115 @@ def register_admin_handlers(
 
         await callback.answer("Неизвестное действие", show_alert=True)
 
+    @router.callback_query(F.data.regexp(r"^admin_chg_lang_cour_(\d+)$"))
+    async def on_chg_lang_cour(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        tg = int(callback.data.split("_")[-1])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🇬🇪 ქართული (Грузинский)", callback_data=f"admin_set_lang_cour_{tg}_ka")],
+                [InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"admin_set_lang_cour_{tg}_ru")],
+                [InlineKeyboardButton(text="🇬🇧 English", callback_data=f"admin_set_lang_cour_{tg}_en")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_courier_{tg}")],
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f"🌐 <b>Смена языка интерфейса для курьера (TG: <code>{tg}</code>)</b>\n\nВыберите новый язык:",
+            keyboard=kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_set_lang_cour_(\d+)_(ka|ru|en)$"))
+    async def on_set_lang_cour(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        tg, lang = int(parts[4]), parts[5]
+        pdb = _deps.get("partners_db_path")
+        if pdb and os.path.exists(pdb):
+            try:
+                conn = _connect(pdb)
+                conn.execute("UPDATE bot_users SET language = ? WHERE telegram_id = ?", (lang, tg))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                log.warning("update courier lang: %s", e)
+
+        lang_names = {"ka": "ქართული", "ru": "Русский", "en": "English"}
+        notify_texts = {
+            "ka": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> თქვენი ინტერფეისის ენა შეიცვალა ადმინისტრატორის მიერ: <b>ქართული</b>',
+            "ru": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Ваш язык интерфейса изменён администратором: <b>Русский</b>',
+            "en": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Your interface language has been updated by admin: <b>English</b>',
+        }
+        try:
+            await _bot().send_message(tg, notify_texts.get(lang, '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Язык интерфейса изменён'), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+        await callback.answer(f"Язык изменён на: {lang_names.get(lang, lang)}", show_alert=True)
+        await open_courier_card(callback.message.chat.id, callback.message.message_id, tg)
+
+    @router.callback_query(F.data.regexp(r"^admin_chg_lang_rest_(.+)$"))
+    async def on_chg_lang_rest(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        rid = callback.data[len("admin_chg_lang_rest_"):]
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🇬🇪 ქართული (Грузинский)", callback_data=f"admin_set_lang_rest_{rid}_ka")],
+                [InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"admin_set_lang_rest_{rid}_ru")],
+                [InlineKeyboardButton(text="🇬🇧 English", callback_data=f"admin_set_lang_rest_{rid}_en")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_restaurant_{rid}")],
+            ]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=f'<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> <b>Смена языка интерфейса для ресторана <code>{rid}</code></b>\n\nВыберите новый язык:',
+            keyboard=kb,
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^admin_set_lang_rest_(.+)_(ka|ru|en)$"))
+    async def on_set_lang_rest(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        parts = callback.data.split("_")
+        lang = parts[-1]
+        rid = "_".join(parts[4:-1])
+        partner_tg = await _resolve_restaurant_tg(rid)
+        if partner_tg > 0:
+            pdb = _deps.get("partners_db_path")
+            if pdb and os.path.exists(pdb):
+                try:
+                    conn = _connect(pdb)
+                    conn.execute("UPDATE bot_users SET language = ? WHERE telegram_id = ?", (lang, partner_tg))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning("update rest lang: %s", e)
+
+            notify_texts = {
+                "ka": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> თქვენი ინტერფეისის ენა შეიცვალა ადმინისტრატორის მიერ: <b>ქართული</b>',
+                "ru": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Ваш язык интерфейса изменён администратором: <b>Русский</b>',
+                "en": '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Your interface language has been updated by admin: <b>English</b>',
+            }
+            try:
+                await _bot().send_message(partner_tg, notify_texts.get(lang, '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> Язык интерфейса изменён'), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
+        lang_names = {"ka": "ქართული", "ru": "Русский", "en": "English"}
+        await callback.answer(f"Язык изменён на: {lang_names.get(lang, lang)}", show_alert=True)
+        await open_restaurant_card(callback.message.chat.id, callback.message.message_id, rid)
+
     @router.message(AdminMessageState.waiting_text)
     async def on_admin_message_text(message: Message, state: FSMContext):
         if not await _is_admin_async(message.from_user.id):
@@ -1795,12 +2529,16 @@ def register_admin_handlers(
         data = await state.get_data()
         target_tg = int(data.get("target_tg") or 0)
         back_cb = str(data.get("back_cb") or "admin_back_home")
+        msg_type = str(data.get("msg_type") or "general")
         await state.clear()
         fn = _ops().get("send_message")
         if not fn or target_tg <= 0:
             await message.answer("Отправка недоступна")
             return
-        ok, msg = await fn(target_tg, message.text or "")
+        try:
+            ok, msg = await fn(target_tg, message.text or "", msg_type=msg_type)
+        except TypeError:
+            ok, msg = await fn(target_tg, message.text or "")
         try:
             await message.delete()
         except Exception:
@@ -1821,6 +2559,377 @@ def register_admin_handlers(
             )
         except Exception:
             pass
+
+    @router.message(AdminCourierEditState.waiting_data)
+    async def on_courier_edit_data_input(message: Message, state: FSMContext):
+        if not await _is_admin_async(message.from_user.id):
+            await state.clear()
+            return
+        data = await state.get_data()
+        target_tg = int(data.get("target_tg") or 0)
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        raw_text = (message.text or "").strip()
+        if raw_text == "/cancel":
+            panel_mid = await _get_panel_message_id(message.chat.id)
+            await open_courier_card(message.chat.id, panel_mid, target_tg)
+            return
+
+        import re
+        phone_match = re.search(r'(\+?[0-9][0-9\s\-()]{6,16}[0-9])', raw_text)
+        new_phone = None
+        new_name = None
+        if phone_match:
+            raw_ph = phone_match.group(1).strip()
+            digits = re.sub(r'\D', '', raw_ph)
+            new_phone = f"+{digits}" if raw_ph.startswith("+") or len(digits) >= 10 else digits
+            rem = (raw_text[:phone_match.start()] + " " + raw_text[phone_match.end():]).strip(" ,;")
+            if rem:
+                new_name = rem
+        else:
+            new_name = raw_text
+
+        # 1) bot_users в partners_bot.db
+        pdb = _deps.get("partners_db_path")
+        if pdb and os.path.exists(pdb) and target_tg > 0:
+            try:
+                conn = _connect(pdb)
+                if new_phone and new_name:
+                    conn.execute("UPDATE bot_users SET phone = ?, name = ? WHERE telegram_id = ?", (new_phone, new_name, target_tg))
+                elif new_phone:
+                    conn.execute("UPDATE bot_users SET phone = ? WHERE telegram_id = ?", (new_phone, target_tg))
+                elif new_name:
+                    conn.execute("UPDATE bot_users SET name = ? WHERE telegram_id = ?", (new_name, target_tg))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                log.warning("courier update bot_users: %s", e)
+
+        # 2) admin_users в auth.db
+        for a_path in _auth_paths():
+            if os.path.exists(a_path) and target_tg > 0:
+                try:
+                    conn = _connect(a_path)
+                    if new_phone and new_name:
+                        conn.execute("UPDATE admin_users SET phone = ?, full_name = ? WHERE telegram_id = ? AND role = 'courier'", (new_phone, new_name, str(target_tg)))
+                    elif new_phone:
+                        conn.execute("UPDATE admin_users SET phone = ? WHERE telegram_id = ? AND role = 'courier'", (new_phone, str(target_tg)))
+                    elif new_name:
+                        conn.execute("UPDATE admin_users SET full_name = ? WHERE telegram_id = ? AND role = 'courier'", (new_name, str(target_tg)))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning("courier update admin_users: %s", e)
+
+        panel_mid = await _get_panel_message_id(message.chat.id)
+        await open_courier_card(message.chat.id, panel_mid, target_tg)
+        try:
+            parts = []
+            if new_name:
+                parts.append(f"имя: <b>{html.escape(new_name)}</b>")
+            if new_phone:
+                parts.append(f"телефон: <b>{html.escape(new_phone)}</b>")
+            summary = ", ".join(parts) or "сохранены"
+            await _bot().send_message(
+                message.chat.id,
+                f"✅ Данные курьера обновлены ({summary})!",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    @router.message(AdminRestEditAddrState.waiting_address)
+    async def on_rest_edit_addr_input(message: Message, state: FSMContext):
+        if not await _is_admin_async(message.from_user.id):
+            await state.clear()
+            return
+        data = await state.get_data()
+        rid = str(data.get("restaurant_id") or "")
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        raw_text = (message.text or "").strip()
+        if raw_text == "/cancel":
+            panel_mid = await _get_panel_message_id(message.chat.id)
+            await open_restaurant_card(message.chat.id, panel_mid, rid)
+            return
+
+        new_addr = raw_text
+        for c_path in _catalog_paths():
+            if os.path.exists(c_path) and rid:
+                try:
+                    conn = _connect(c_path)
+                    conn.execute("UPDATE restaurants SET address = ? WHERE id = ?", (new_addr, rid))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning("rest update address catalog: %s", e)
+
+        panel_mid = await _get_panel_message_id(message.chat.id)
+        await open_restaurant_card(message.chat.id, panel_mid, rid)
+        try:
+            await _bot().send_message(
+                message.chat.id,
+                f"✅ Адрес ресторана обновлен:\n<code>{html.escape(new_addr)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    @router.message(AdminRestEditPhoneState.waiting_phone)
+    async def on_rest_edit_phone_input(message: Message, state: FSMContext):
+        if not await _is_admin_async(message.from_user.id):
+            await state.clear()
+            return
+        data = await state.get_data()
+        rid = str(data.get("restaurant_id") or "")
+        await state.clear()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        raw_text = (message.text or "").strip()
+        if raw_text == "/cancel":
+            panel_mid = await _get_panel_message_id(message.chat.id)
+            await open_restaurant_card(message.chat.id, panel_mid, rid)
+            return
+
+        new_phone = raw_text
+        for c_path in _catalog_paths():
+            if os.path.exists(c_path) and rid:
+                try:
+                    conn = _connect(c_path)
+                    conn.execute("UPDATE restaurants SET phone = ? WHERE id = ?", (new_phone, rid))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning("rest update phone catalog: %s", e)
+
+        for a_path in _auth_paths():
+            if os.path.exists(a_path) and rid:
+                try:
+                    conn = _connect(a_path)
+                    conn.execute("UPDATE admin_users SET phone = ? WHERE restaurant_id = ? AND role = 'restaurant_admin'", (new_phone, rid))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+        panel_mid = await _get_panel_message_id(message.chat.id)
+        await open_restaurant_card(message.chat.id, panel_mid, rid)
+        try:
+            await _bot().send_message(
+                message.chat.id,
+                f"✅ Телефон ресторана обновлен: <b>{html.escape(new_phone)}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    # ── CSV Export ───────────────────────────────────────────
+
+    @router.message(Command("export"))
+    @router.callback_query(F.data == "admin_export_csv")
+    async def on_admin_export_csv_menu(event: Message | CallbackQuery):
+        tg = event.from_user.id
+        if not await _is_admin_async(tg):
+            if isinstance(event, CallbackQuery):
+                await event.answer("Доступ запрещён", show_alert=True)
+            return
+        chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
+        mid = None if isinstance(event, Message) else event.message.message_id
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📅 За сегодня", callback_data="admin_csv_today")],
+                [InlineKeyboardButton(text="📅 За 7 дней", callback_data="admin_csv_week")],
+                [InlineKeyboardButton(text="📅 За всё время", callback_data="admin_csv_all")],
+                [InlineKeyboardButton(text="← Назад", callback_data="admin_back_home")],
+            ]
+        )
+        text = (
+            f'{_ce(_E().get("btn_orders", "5384244502040975393"), "📊")} '
+            f"<b>Экспорт финансового отчёта по заказам (Excel / CSV)</b>\n\n"
+            f"Выберите период для выгрузки отчёта:"
+        )
+        if isinstance(event, CallbackQuery):
+            await render_admin(chat_id, message_id=mid, text=text, keyboard=kb)
+            await event.answer()
+        else:
+            await event.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+    @router.callback_query(F.data.in_({"admin_csv_today", "admin_csv_week", "admin_csv_all"}))
+    async def on_admin_csv_download(callback: CallbackQuery):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        period = callback.data.replace("admin_csv_", "")
+        csv_str = _generate_orders_csv(period)
+        if not csv_str:
+            await callback.answer("Нет данных за выбранный период", show_alert=True)
+            return
+        await callback.answer("Генерирую файл...")
+        csv_bytes = csv_str.encode("utf-8-sig")
+        date_tag = datetime.now().strftime("%Y_%m_%d")
+        file = BufferedInputFile(csv_bytes, filename=f"mestidelivery_{period}_{date_tag}.csv")
+        labels = {"today": "за сегодня", "week": "за 7 дней", "all": "за всё время"}
+        await _bot().send_document(
+            callback.message.chat.id,
+            document=file,
+            caption=f"📊 <b>Отчёт по заказам MestiDelivery ({labels.get(period, period)})</b>\n\nФайл готов к открытию в Excel.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Broadcast System ─────────────────────────────────────
+
+    @router.message(Command("broadcast"))
+    @router.callback_query(F.data == "admin_broadcast")
+    async def on_admin_broadcast_menu(event: Message | CallbackQuery, state: FSMContext):
+        tg = event.from_user.id
+        if not await _is_admin_async(tg):
+            if isinstance(event, CallbackQuery):
+                await event.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.clear()
+        chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
+        mid = None if isinstance(event, Message) else event.message.message_id
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🍳 Только ресторанам", callback_data="admin_bc_target_rest")],
+                [InlineKeyboardButton(text="🚴 Только курьерам", callback_data="admin_bc_target_cour")],
+                [InlineKeyboardButton(text="🌐 Всем партнёрам", callback_data="admin_bc_target_all")],
+                [InlineKeyboardButton(text="← Назад", callback_data="admin_back_home")],
+            ]
+        )
+        text = (
+            f'{_ce(_E().get("btn_support", "5382097310450753507"), "📢")} '
+            f"<b>Массовая рассылка анонсов</b>\n\n"
+            f"Выберите целевую аудиторию для рассылки сообщения:"
+        )
+        if isinstance(event, CallbackQuery):
+            await render_admin(chat_id, message_id=mid, text=text, keyboard=kb)
+            await event.answer()
+        else:
+            await event.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+    @router.callback_query(F.data.in_({"admin_bc_target_rest", "admin_bc_target_cour", "admin_bc_target_all"}))
+    async def on_admin_bc_target_choose(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        target = callback.data.replace("admin_bc_target_", "")
+        recipients = _get_broadcast_recipients(target)
+        labels = {"rest": "Рестораны", "cour": "Курьеры", "all": "Все партнёры"}
+        await state.set_state(AdminBroadcastState.waiting_text)
+        await state.update_data(target=target, recipient_count=len(recipients))
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back_home")]]
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=(
+                f"📢 <b>Рассылка: {labels.get(target, target)}</b>\n"
+                f"Получателей в базе: <b>{len(recipients)}</b>\n\n"
+                f"📝 Отправьте в этот чат сообщение (текст или фото с текстом), которое нужно разослать. Поддерживается HTML-разметка."
+            ),
+            keyboard=kb,
+        )
+        await callback.answer()
+
+    @router.message(AdminBroadcastState.waiting_text)
+    async def on_admin_bc_text_received(message: Message, state: FSMContext):
+        if not await _is_admin_async(message.from_user.id):
+            return
+        data = await state.get_data()
+        target = data.get("target", "all")
+        recipients = _get_broadcast_recipients(target)
+        bc_text = message.html_text or message.text or message.caption or ""
+
+        await state.update_data(bc_text=bc_text)
+        labels = {"rest": "Ресторанам", "cour": "Курьерам", "all": "Всем партнёрам"}
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🚀 Отправить рассылку", callback_data="admin_bc_do_send"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back_home"),
+                ]
+            ]
+        )
+        panel_mid = await _get_panel_message_id(message.chat.id)
+        preview = (
+            f"📢 <b>Подтверждение рассылки для: {labels.get(target, target)}</b>\n"
+            f"Получателей: <b>{len(recipients)}</b>\n\n"
+            f"<b>Предпросмотр сообщения:</b>\n"
+            f"────────────────────\n"
+            f"{bc_text}\n"
+            f"────────────────────\n\n"
+            f"Отправить сообщение всем {len(recipients)} получателям?"
+        )
+        await render_admin(message.chat.id, message_id=panel_mid, text=preview, keyboard=kb)
+
+    @router.callback_query(F.data == "admin_bc_do_send")
+    async def on_admin_bc_execute(callback: CallbackQuery, state: FSMContext):
+        if not await _is_admin_async(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        data = await state.get_data()
+        target = data.get("target", "all")
+        bc_text = data.get("bc_text", "")
+        await state.clear()
+
+        recipients = _get_broadcast_recipients(target)
+        if not recipients:
+            await callback.answer("Нет получателей для рассылки", show_alert=True)
+            await open_home(callback.message.chat.id, callback.message.message_id)
+            return
+
+        await callback.answer("Рассылка запущена...")
+        sent = 0
+        failed = 0
+        bot_inst = _bot()
+        E = _E()
+        header = f'{_ce(E.get("btn_support", "5382097310450753507"), "📢")} <b>Объявление от платформы:</b>\n\n'
+
+        for tid in recipients:
+            try:
+                await bot_inst.send_message(
+                    chat_id=tid,
+                    text=header + bc_text,
+                    parse_mode=ParseMode.HTML,
+                )
+                sent += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                failed += 1
+
+        res_text = (
+            f"✅ <b>Рассылка успешно завершена!</b>\n\n"
+            f"• Успешно доставлено: <b>{sent}</b>\n"
+            f"• Ошибок доставки: <b>{failed}</b>"
+        )
+        await render_admin(
+            callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=res_text,
+            keyboard=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="← В главное меню", callback_data="admin_back_home")]]
+            ),
+        )
 
 
 # ── SLA alerts ───────────────────────────────────────────────

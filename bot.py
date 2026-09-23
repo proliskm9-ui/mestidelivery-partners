@@ -16,19 +16,26 @@ MestiDelivery — Partners Bot (Бот для ресторанов-партнё�
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
 
+GEORGIA_TZ = timezone(timedelta(hours=4))
+
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.enums import ButtonStyle, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -92,8 +99,8 @@ CATALOG_DB_PATHS = [os.path.join(_BACKEND_DATA, "catalog.db")]
 ORDER_DB_PATHS = [os.path.join(_BACKEND_DATA, "order.db")]
 
 # Доли от суммы позиций (items = total - delivery_fee - service_fee - tips) после delivered.
-PLATFORM_ITEMS_COMMISSION = 0.15  # 15% сервису
-RESTAURANT_ITEMS_SHARE = 0.85     # 85% ресторану
+PLATFORM_ITEMS_COMMISSION = 0.10  # 10% сервису
+RESTAURANT_ITEMS_SHARE = 0.90     # 90% ресторану
 # delivery_fee → 100% курьеру; tips → 100% курьеру; service_fee → 100% сервису.
 
 SECURITY_HEADER = "X-Bot-Security-Token"
@@ -103,10 +110,28 @@ ADMIN_TG_ID: int = int(os.getenv("ADMIN_TELEGRAM_ID", "5564438585") or "55644385
 if ADMIN_TG_ID <= 0:
     ADMIN_TG_ID = 5564438585
 
+JWT_SECRET: str = os.getenv("JWT_SECRET", "super_secure_secret_change_me_in_production_12345")
+
+
+def make_hs256_jwt(payload: dict, secret: str = JWT_SECRET) -> str:
+    """Generates standard HS256 JWT access token compatible with Mestigo Gateway."""
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    sig_b64 = b64url(signature)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
 def connect_sqlite_wal(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=15.0)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=15000;")
     except Exception:
         pass
     return conn
@@ -220,6 +245,25 @@ CREATE TABLE IF NOT EXISTS courier_blocks (
     created_by  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS synced_orders (
+    id              INTEGER PRIMARY KEY,
+    restaurant_id   TEXT    NOT NULL DEFAULT '',
+    courier_id      INTEGER NOT NULL DEFAULT 0,
+    status          TEXT    NOT NULL DEFAULT 'new',
+    total           REAL    NOT NULL DEFAULT 0.0,
+    delivery_fee    REAL    NOT NULL DEFAULT 0.0,
+    customer_name   TEXT    NOT NULL DEFAULT '',
+    phone           TEXT    NOT NULL DEFAULT '',
+    address         TEXT    NOT NULL DEFAULT '',
+    comment         TEXT    NOT NULL DEFAULT '',
+    items_json      TEXT    NOT NULL DEFAULT '[]',
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_synced_orders_rest ON synced_orders(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_synced_orders_cour ON synced_orders(courier_id);
+CREATE INDEX IF NOT EXISTS idx_synced_orders_stat ON synced_orders(status);
 """
 
 
@@ -240,6 +284,15 @@ class Database:
         try:
             # Локальный UI-статус open/close (каталог меняет админ вручную)
             await self._db.execute("ALTER TABLE partners ADD COLUMN ui_is_open INTEGER")
+        except Exception:
+            pass
+        try:
+            # Режим запары (rush mode): 0 = auto (18-22), 1 = forced on, -1 = forced off
+            await self._db.execute("ALTER TABLE partners ADD COLUMN rush_mode INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await self._db.execute("ALTER TABLE admin_sla_alerts ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         await self._db.executescript(
@@ -287,11 +340,47 @@ class Database:
             return dict(row) if row else None
 
     async def get_partner_by_restaurant(self, restaurant_id: str) -> Optional[dict]:
+        rid = str(restaurant_id or "").strip()
+        if not rid:
+            return None
         async with self._db.execute(
-            "SELECT * FROM partners WHERE restaurant_id = ?", (restaurant_id,)
+            "SELECT * FROM partners WHERE restaurant_id = ?", (rid,)
         ) as cur:
             row = await cur.fetchone()
-            return dict(row) if row else None
+            if row and row["telegram_id"]:
+                return dict(row)
+
+        def _check_auth():
+            for path in BACKEND_DB_PATHS:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    conn = connect_sqlite_wal(path)
+                    r = conn.execute(
+                        "SELECT id, username, telegram_id, restaurant_id FROM admin_users "
+                        "WHERE restaurant_id = ? AND telegram_id IS NOT NULL AND telegram_id != ''",
+                        (rid,),
+                    ).fetchone()
+                    conn.close()
+                    if r and r[2]:
+                        return {"telegram_id": int(r[2]), "restaurant_id": rid, "restaurant_name": r[1]}
+                except Exception:
+                    pass
+            return None
+
+        auth_partner = await asyncio.to_thread(_check_auth)
+        if auth_partner:
+            try:
+                await self.register_partner(
+                    auth_partner["telegram_id"],
+                    rid,
+                    auth_partner.get("restaurant_name") or "",
+                )
+            except Exception:
+                pass
+            return auth_partner
+
+        return None
 
     async def register_partner(
         self, telegram_id: int, restaurant_id: str, restaurant_name: str = ""
@@ -321,6 +410,34 @@ class Database:
             return True
         except Exception as e:
             log.error("set_partner_ui_open error: %s", e)
+            return False
+
+    async def get_partner_rush_mode(self, restaurant_id: str) -> int:
+        if not restaurant_id:
+            return 0
+        try:
+            async with self._db.execute(
+                "SELECT rush_mode FROM partners WHERE restaurant_id = ?", (str(restaurant_id),)
+            ) as cur:
+                row = await cur.fetchone()
+                if row and row["rush_mode"] is not None:
+                    return int(row["rush_mode"])
+        except Exception as e:
+            log.error("get_partner_rush_mode error: %s", e)
+        return 0
+
+    async def set_partner_rush_mode(self, restaurant_id: str, mode: int) -> bool:
+        if not restaurant_id:
+            return False
+        try:
+            await self._db.execute(
+                "UPDATE partners SET rush_mode = ? WHERE restaurant_id = ?",
+                (mode, str(restaurant_id)),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            log.error("set_partner_rush_mode error: %s", e)
             return False
 
     async def list_partners(self) -> list[dict]:
@@ -540,15 +657,28 @@ class Database:
             log.error("sla_alert_sent error: %s", e)
             return False
 
-    async def mark_sla_alert(self, order_id: int, alert_type: str) -> None:
+    async def mark_sla_alert(self, order_id: int, alert_type: str, message_id: int = 0) -> None:
         try:
             await self._db.execute(
-                "INSERT OR IGNORE INTO admin_sla_alerts (order_id, alert_type) VALUES (?, ?)",
-                (int(order_id), str(alert_type)),
+                """INSERT INTO admin_sla_alerts (order_id, alert_type, message_id) VALUES (?, ?, ?)
+                   ON CONFLICT(order_id, alert_type) DO UPDATE SET message_id = excluded.message_id""",
+                (int(order_id), str(alert_type), int(message_id)),
             )
             await self._db.commit()
         except Exception as e:
             log.error("mark_sla_alert error: %s", e)
+
+    async def get_sla_alerts(self, order_id: int) -> list[int]:
+        try:
+            async with self._db.execute(
+                "SELECT message_id FROM admin_sla_alerts WHERE order_id = ? AND message_id > 0",
+                (int(order_id),),
+            ) as cur:
+                rows = await cur.fetchall()
+            return [int(r["message_id"]) for r in rows]
+        except Exception as e:
+            log.error("get_sla_alerts error: %s", e)
+            return []
 
     async def get_courier_block(self, telegram_id: int) -> Optional[dict]:
         try:
@@ -677,6 +807,106 @@ class Database:
             log.error("set_courier_online_status error: %s", e)
             return False
 
+    async def set_user_language(self, telegram_id: int, language: str) -> bool:
+        try:
+            await self._db.execute("UPDATE bot_users SET language = ? WHERE telegram_id = ?", (language, telegram_id))
+            await self._db.commit()
+            return True
+        except Exception as e:
+            log.error("set_user_language error: %s", e)
+            return False
+
+    async def get_all_bot_users(self) -> list[dict]:
+        async with self._db.execute("SELECT * FROM bot_users") as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def save_synced_order(self, order_data: dict) -> bool:
+        try:
+            oid = int(order_data.get("id") or order_data.get("order_id") or 0)
+            if oid <= 0:
+                return False
+            rid = str(order_data.get("restaurant_id") or "")
+            cid = int(order_data.get("courier_id") or 0)
+            st = str(order_data.get("status") or "new")
+            tot = float(order_data.get("total") or 0.0)
+            fee = float(order_data.get("delivery_fee") or 0.0)
+            cname = str(order_data.get("customer_name") or "")
+            phone = str(order_data.get("phone") or "")
+            addr = str(order_data.get("address") or "")
+            comm = str(order_data.get("comment") or "")
+            items = order_data.get("items") or []
+            items_str = json.dumps(items, ensure_ascii=False) if not isinstance(items, str) else items
+            c_at = str(order_data.get("created_at") or "")
+
+            await self._db.execute(
+                """INSERT INTO synced_orders (id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), datetime('now'))
+                   ON CONFLICT(id) DO UPDATE SET
+                     restaurant_id = CASE WHEN excluded.restaurant_id != '' THEN excluded.restaurant_id ELSE synced_orders.restaurant_id END,
+                     courier_id = CASE WHEN excluded.courier_id > 0 THEN excluded.courier_id ELSE synced_orders.courier_id END,
+                     status = excluded.status,
+                     total = CASE WHEN excluded.total > 0 THEN excluded.total ELSE synced_orders.total END,
+                     delivery_fee = CASE WHEN excluded.delivery_fee > 0 THEN excluded.delivery_fee ELSE synced_orders.delivery_fee END,
+                     customer_name = CASE WHEN excluded.customer_name != '' THEN excluded.customer_name ELSE synced_orders.customer_name END,
+                     phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE synced_orders.phone END,
+                     address = CASE WHEN excluded.address != '' THEN excluded.address ELSE synced_orders.address END,
+                     comment = CASE WHEN excluded.comment != '' THEN excluded.comment ELSE synced_orders.comment END,
+                     items_json = CASE WHEN excluded.items_json != '[]' THEN excluded.items_json ELSE synced_orders.items_json END,
+                     updated_at = datetime('now')""",
+                (oid, rid, cid, st, tot, fee, cname, phone, addr, comm, items_str, c_at),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            log.error("save_synced_order error: %s", e)
+            return False
+
+    async def update_synced_order_status(self, order_id: int, status: str, courier_id: int = 0) -> bool:
+        try:
+            if courier_id > 0:
+                await self._db.execute(
+                    "UPDATE synced_orders SET status = ?, courier_id = ?, updated_at = datetime('now') WHERE id = ?",
+                    (status, courier_id, int(order_id)),
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE synced_orders SET status = ?, updated_at = datetime('now') WHERE id = ?",
+                    (status, int(order_id)),
+                )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            log.error("update_synced_order_status error: %s", e)
+            return False
+
+    async def get_synced_orders(self, restaurant_id: str = "", courier_id: int = 0, limit: int = 100) -> list[dict]:
+        try:
+            if restaurant_id:
+                async with self._db.execute(
+                    "SELECT * FROM synced_orders WHERE restaurant_id = ? ORDER BY id DESC LIMIT ?",
+                    (restaurant_id, limit),
+                ) as cur:
+                    rows = await cur.fetchall()
+                    return [dict(r) for r in rows]
+            elif courier_id > 0:
+                async with self._db.execute(
+                    "SELECT * FROM synced_orders WHERE courier_id = ? OR (courier_id = 0 AND status IN ('confirmed', 'accepted', 'preparing', 'ready')) ORDER BY id DESC LIMIT ?",
+                    (courier_id, limit),
+                ) as cur:
+                    rows = await cur.fetchall()
+                    return [dict(r) for r in rows]
+            else:
+                async with self._db.execute(
+                    "SELECT * FROM synced_orders ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ) as cur:
+                    rows = await cur.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            log.error("get_synced_orders error: %s", e)
+            return []
+
     async def offline_other_sessions(self, telegram_id: int, username: str) -> None:
         """Снимает is_online с других TG того же логина (после смены аккаунта)."""
         try:
@@ -779,9 +1009,9 @@ class Database:
 
     @staticmethod
     def _items_amount_sql() -> str:
-        # items = total - delivery - service - tips (чаевые курьеру, не в долю ресторана/платформы)
+        # items = total + discount - delivery - service - tips (скидку на доставку компенсирует сервис, курьер получает 100% базы)
         return (
-            "MAX(0, COALESCE(total, 0) - COALESCE(delivery_fee, 0) "
+            "MAX(0, COALESCE(total, 0) + COALESCE(discount, 0) - COALESCE(delivery_fee, 0) "
             "- COALESCE(service_fee, 0) - COALESCE(tips, 0))"
         )
 
@@ -1061,17 +1291,29 @@ class Database:
             row = await cur.fetchone()
             return dict(row) if row else None
 
-    async def create_payout_request(self, partner_id: str, role: str, amount: float) -> bool:
+    async def create_payout_request(self, partner_id: str, role: str, amount: float) -> Optional[int]:
         try:
-            await self._db.execute(
+            cur = await self._db.execute(
                 "INSERT INTO payout_requests (partner_id, role, amount) VALUES (?, ?, ?)",
                 (str(partner_id), role, amount)
             )
             await self._db.commit()
-            return True
+            return cur.lastrowid
         except Exception as e:
             log.error(f"Error creating payout request: {e}")
-            return False
+            return None
+
+    async def get_partner_pending_request(self, partner_id: str, role: str) -> Optional[dict]:
+        try:
+            async with self._db.execute(
+                "SELECT id, amount, created_at FROM payout_requests WHERE partner_id = ? AND role = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                (str(partner_id), role)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            log.error(f"Error getting pending payout request: {e}")
+            return None
 
     async def get_restaurant_status_and_hours(self, restaurant_id: str) -> tuple[int, str]:
         """Ищет ресторан во всех catalog.db. По умолчанию открыт (is_active=1)."""
@@ -1303,34 +1545,73 @@ def make_order_keyboard(order_id: int, lang: str = "ru") -> InlineKeyboardMarkup
 
 # Окна принятия заказа (баннер + caption + SLA).
 RESTAURANT_ACCEPT_MIN = 5   # ресторану ~5 минут
-COURIER_ACCEPT_MIN = 10     # курьеру обычно 5–10 мин (пока готовится); дедлайн = верхняя граница
+COURIER_ACCEPT_MIN = 5      # курьеру 5 минут на принятие оффера
+
+
+def _format_georgia_time(value) -> str:
+    """Форматирует timestamp / ISO / SQLite время в HH:MM по Грузии (UTC+4)."""
+    now_geo = datetime.now(GEORGIA_TZ)
+    if not value:
+        return now_geo.strftime("%H:%M")
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(GEORGIA_TZ).strftime("%H:%M")
+        except Exception:
+            return now_geo.strftime("%H:%M")
+    raw = str(value).strip()
+    try:
+        if "T" in raw or "+" in raw or "Z" in raw:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(GEORGIA_TZ).strftime("%H:%M")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%H:%M"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                if fmt == "%H:%M":
+                    return raw
+                dt = dt.replace(tzinfo=timezone.utc).astimezone(GEORGIA_TZ)
+                return dt.strftime("%H:%M")
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return now_geo.strftime("%H:%M")
 
 
 def _format_order_time(value, *, minutes: int = RESTAURANT_ACCEPT_MIN) -> tuple[str, str]:
-    """Возвращает (создан HH:MM, принять_до HH:MM)."""
-    created_dt = datetime.now()
+    """Возвращает (создан HH:MM, принять_до HH:MM) с учётом таймзоны Грузии (UTC+4)."""
+    now_geo = datetime.now(GEORGIA_TZ)
+    created_dt = now_geo
     if value:
         if isinstance(value, (int, float)):
-            created_dt = datetime.fromtimestamp(value)
+            try:
+                created_dt = datetime.fromtimestamp(value, tz=timezone.utc).astimezone(GEORGIA_TZ)
+            except Exception:
+                created_dt = now_geo
         else:
             raw = str(value).strip()
             try:
-                created_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                if created_dt.tzinfo is not None:
-                    created_dt = created_dt.astimezone().replace(tzinfo=None)
-            except ValueError:
-                for fmt in ("%H:%M", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
-                    try:
-                        parsed = datetime.strptime(raw, fmt)
-                        if fmt == "%H:%M":
-                            created_dt = datetime.now().replace(
-                                hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0
-                            )
-                        else:
-                            created_dt = parsed
-                        break
-                    except ValueError:
-                        continue
+                if "T" in raw or "+" in raw or "Z" in raw:
+                    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    created_dt = parsed.astimezone(GEORGIA_TZ)
+                else:
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%H:%M"):
+                        try:
+                            parsed = datetime.strptime(raw, fmt)
+                            if fmt == "%H:%M":
+                                created_dt = now_geo.replace(
+                                    hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0
+                                )
+                            else:
+                                created_dt = parsed.replace(tzinfo=timezone.utc).astimezone(GEORGIA_TZ)
+                            break
+                        except ValueError:
+                            continue
+            except Exception:
+                created_dt = now_geo
     deadline = created_dt + timedelta(minutes=minutes)
     return created_dt.strftime("%H:%M"), deadline.strftime("%H:%M")
 
@@ -1452,15 +1733,126 @@ def _fetch_order_fees_sync(order_id: int) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def format_order_message(data: dict, lang: str = "ru") -> str:
-    """HTML-карточка нового заказа: состав + сумма только по позициям (без доставки/сервиса)."""
+def get_order_current_status(order_id: int) -> Optional[str]:
+    """Возвращает статус заказа из order.db: pending, accepted, preparing, ready, delivering, delivered, cancelled."""
+    for path in ORDER_DB_PATHS:
+        if os.path.exists(path):
+            try:
+                conn = connect_sqlite_wal(path)
+                row = conn.execute("SELECT status FROM orders WHERE id = ?", (int(order_id),)).fetchone()
+                conn.close()
+                if row and row[0]:
+                    return str(row[0]).strip().lower()
+            except Exception as e:
+                log.warning("get_order_current_status failed order=%s path=%s: %s", order_id, path, e)
+    return None
+
+
+def _get_order_row(order_id: int) -> dict:
+    """Загружает полную строку заказа из order.db (с распарсенными items)."""
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        return {}
+    for path in ORDER_DB_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            conn = connect_sqlite_wal(path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+            conn.close()
+            if row:
+                d = dict(row)
+                raw_items = d.get("items")
+                if isinstance(raw_items, str):
+                    try:
+                        d["items"] = json.loads(raw_items)
+                    except Exception:
+                        d["items"] = []
+                d["order_id"] = oid
+                return d
+        except Exception as e:
+            log.warning("_get_order_row failed order=%s path=%s: %s", order_id, path, e)
+    return {}
+
+
+SUNSET_RESTAURANT_IDS = {"rest-1785108442716453469", "sunset-restaurant"}
+SUNSET_COMBINABLE_KEYWORDS = (
+    "мწვადი", "шашлык", "barbecue", "mtsvadi",
+    "კუბდარი", "кубдари", "kubdari",
+    "ხაჭაპური", "хачапури", "khachapuri",
+    "ჭვიშტარი", "чвиштари", "chvishtari",
+    "ფრი", "фри", "fries",
+    "პური", "хлеб", "bread",
+    "ხინკალი", "хинкали", "khinkali",
+)
+SUNSET_FREE_KEYWORDS = (
+    "borjomi", "боржоми", "coca", "кола", "вода", "water", "წყალი",
+    "лимонад", "lemonade", "ლიმონათი", "чай", "tea", "ჩაი",
+    "кофе", "coffee", "ყავა", "соус", "sauce", "სოუსი",
+    "ткемали", "ტყემალი", "сацебели", "საწებელი", "баже", "ბაჟე",
+    "кетчуп", "кетчупи", "сметана", "არაჟანი", "набеглави", "ნაბეღლავი",
+    "ნაბეგლავი", "сок", "juice", "წვენი",
+)
+
+
+def is_sunset_restaurant(rest_id: str, rest_name: str = "") -> bool:
+    rid = str(rest_id or "").strip().lower()
+    rname = str(rest_name or "").strip().lower()
+    return rid in SUNSET_RESTAURANT_IDS or "sunset" in rid or "sunset" in rname
+
+
+def calculate_sunset_packaging(items: list) -> tuple[int, float]:
+    """
+    Правила упаковки для Sunset Restaurant:
+    - Комбинируемые блюда (шашлык, кубдари, хачапури, чвиштари, фри, хлеб, хинкали) при повторе кладут в один бокс (1 бокс на строку позиции).
+    - Напитки и соусы — бесплатно (0 боксов).
+    - Остальные блюда (супы, соусные горячие блюда, салаты) — индивидуальный контейнер на каждую порцию (qty боксов).
+    - Стоимость одного бокса: 2.0 GEL.
+    """
+    boxes = 0
+    for it in items:
+        name = str(it.get("name") or "").lower()
+        qty = int(it.get("quantity") or 1)
+        cat = str(it.get("category") or "").lower()
+        if any(w in name for w in SUNSET_FREE_KEYWORDS) or cat in ("напитки", "соусы", "drinks", "sauces"):
+            continue
+        if any(kw in name for kw in SUNSET_COMBINABLE_KEYWORDS):
+            boxes += 1
+        else:
+            boxes += qty
+    fee = float(boxes * 2.0)
+    return boxes, fee
+
+
+def format_order_message(
+    data: dict,
+    lang: str = "ru",
+    *,
+    delivered: bool = False,
+    status: str = "",
+    ready_time: str = "",
+) -> str:
+    """HTML-карточка заказа ресторана: состав + приборы + сумма позиций."""
     order_id = data.get("order_id", "?")
     comment = _clean_order_comment(data.get("comment") or "")
     items = data.get("items") or []
-    created_hm, deadline_hm = _format_order_time(
-        data.get("created_at"), minutes=RESTAURANT_ACCEPT_MIN
-    )
     item_fallback = t(lang, "item_fallback")
+
+    rest_id = str(data.get("restaurant_id") or "").strip()
+    rest_name = str(data.get("restaurant_name") or "").strip()
+    if not rest_id and order_id and str(order_id) != "?":
+        ord_row = _get_order_row(order_id)
+        if ord_row:
+            rest_id = str(ord_row.get("restaurant_id") or "").strip()
+            rest_name = str(ord_row.get("restaurant_name") or rest_name).strip()
+
+    is_sunset = is_sunset_restaurant(rest_id, rest_name)
+    packaging_boxes = 0
+    packaging_fee = 0.0
+    if is_sunset:
+        packaging_boxes, packaging_fee = calculate_sunset_packaging(items)
 
     items_lines: list[str] = []
     food_total = 0.0
@@ -1471,30 +1863,97 @@ def format_order_message(data: dict, lang: str = "ru") -> str:
         unit = float(item.get("price") or 0)
         line_total = unit * qty
         food_total += line_total
-        items_lines.append(f" • <b>{name}</b> × {qty} — {_fmt_caption_lari(line_total)}")
+        items_lines.append(f"<b>{qty}\u00A0×</b> {name} · {_fmt_caption_lari(line_total)}")
 
-    try:
-        cutlery = int(data.get("cutlery_count") or 0)
-    except (TypeError, ValueError):
-        cutlery = 0
-    if cutlery > 0:
-        if items_lines:
-            items_lines.append("")
-        items_lines.append(f" • {t(lang, 'rest_cutlery', n=cutlery)}")
+    if is_sunset and packaging_boxes > 0:
+        food_total += packaging_fee
+        if lang == "ka":
+            items_lines.append(f"<b>შეფუთვა:</b> {packaging_boxes} ბოქსი · {_fmt_caption_lari(packaging_fee)}")
+        elif lang == "ru":
+            box_word = "бокс" if packaging_boxes == 1 else ("бокса" if 2 <= packaging_boxes % 10 <= 4 and not (11 <= packaging_boxes % 100 <= 14) else "боксов")
+            items_lines.append(f"<b>Упаковка:</b> {packaging_boxes} {box_word} · {_fmt_caption_lari(packaging_fee)}")
+        else:
+            box_word = "box" if packaging_boxes == 1 else "boxes"
+            items_lines.append(f"<b>Packaging:</b> {packaging_boxes} {box_word} · {_fmt_caption_lari(packaging_fee)}")
 
-    items_block = "\n".join(items_lines) if items_lines else " —"
-    comment_text = html.escape(comment) if comment else t(lang, "comment_none")
+    items_block = "<blockquote>" + "\n".join(items_lines) + "</blockquote>" if items_lines else " —"
+
+    if delivered:
+        if lang == "ka":
+            header = f'{ce("5384244502040975393", "✅")} <b>შეკვეთა #{order_id} დასრულებულია</b>'
+        elif lang == "ru":
+            header = f'{ce("5384244502040975393", "✅")} <b>ЗАКАЗ #{order_id} ЗАВЕРШЁН</b>'
+        else:
+            header = f'{ce("5384244502040975393", "✅")} <b>ORDER #{order_id} COMPLETED</b>'
+    elif status == "ready":
+        if lang == "ka":
+            header = f'{ce("5384138412053796842", "📦")} <b>შეკვეთა #{order_id} მზადაა გასაცემად</b>'
+        elif lang == "ru":
+            header = f'{ce("5384138412053796842", "📦")} <b>ЗАКАЗ #{order_id} ГОТОВ К ВЫДАЧЕ</b>'
+        else:
+            header = f'{ce("5384138412053796842", "📦")} <b>ORDER #{order_id} READY FOR PICKUP</b>'
+    elif status == "preparing" or ready_time:
+        if ready_time:
+            if lang == "ka":
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>შეკვეთა #{order_id} მზადდება · გაცემა {ready_time}-მდე</b>'
+            elif lang == "ru":
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>ЗАКАЗ #{order_id} ГОТОВИТСЯ · Выдача до {ready_time}</b>'
+            else:
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>ORDER #{order_id} PREPARING · Ready by {ready_time}</b>'
+        else:
+            if lang == "ka":
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>შეკვეთა #{order_id} მზადდება</b>'
+            elif lang == "ru":
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>ЗАКАЗ #{order_id} ГОТОВИТСЯ</b>'
+            else:
+                header = f'{ce("5384312315279612142", "👨‍🍳")} <b>ORDER #{order_id} PREPARING</b>'
+    else:
+        header = f'{ce("5384244502040975393", "🔔")} <b>{t(lang, "rest_new_order_title", order_id=order_id)}</b>'
 
     parts = [
-        f'{ce("5384244502040975393", "🔔")} <b>{t(lang, "rest_new_order_title", order_id=order_id)}</b>',
-        f" <b>{t(lang, 'rest_created_accept_until', created=created_hm, deadline=deadline_hm)}</b>",
+        header,
         "",
-        f'{ce("5384312315279612142", "🛒")} <b>{t(lang, "rest_order_items")}</b>',
-        items_block,
-        "",
-        f'{ce("5384520939021048827", "💰")} <b>{t(lang, "rest_order_total")}</b> {_fmt_caption_lari(food_total)}',
-        f'{ce("5382097310450753507", "💬")} <b>{t(lang, "rest_comment")}</b> {comment_text}',
+        f'{ce("5384312315279612142", "🛒")} <b>{t(lang, "rest_order_items")}</b>\n{items_block}',
     ]
+
+    has_comment = bool(
+        comment
+        and comment.strip()
+        and comment.strip().lower() not in ("нет", "none", "—", "-", "არ არის", "no")
+    )
+    if has_comment:
+        parts.append(
+            f'\n{ce("5382097310450753507", "💬")} <b>{t(lang, "rest_comment")}</b>\n<blockquote>{html.escape(comment.strip())}</blockquote>'
+        )
+
+    cutlery_val = data.get("cutlery_count")
+    if cutlery_val is None:
+        cutlery_val = data.get("cutlery")
+    if cutlery_val is None and order_id and str(order_id) != "?":
+        cutlery_val = _lookup_order_cutlery(order_id)
+    try:
+        cutlery_count = int(cutlery_val or 0)
+    except (TypeError, ValueError):
+        cutlery_count = 0
+
+    if lang == "ka":
+        cutlery_label = "დანა-ჩანგალი:"
+        cutlery_str = f"{cutlery_count} ც." if cutlery_count > 0 else "არ არის საჭირო"
+    elif lang == "ru":
+        cutlery_label = "Приборы:"
+        cutlery_str = f"{cutlery_count} шт." if cutlery_count > 0 else "не требуются"
+    else:
+        cutlery_label = "Cutlery:"
+        cutlery_str = f"{cutlery_count} pcs" if cutlery_count > 0 else "not needed"
+
+    bottom_lines = [
+        f'{ce("5382351125838077755", "🍴")} <b>{cutlery_label}</b> <b>{cutlery_str}</b>',
+        f'{ce("5384520939021048827", "💰")} <b>{t(lang, "rest_order_total")}</b> <b>{_fmt_caption_lari(food_total)}</b>',
+    ]
+
+    # Приборы, упаковка и сумма заказа в самом низу карточки — прямо перед кнопками
+    parts.append("\n" + "\n".join(bottom_lines))
+
     return "\n".join(parts)
 
 
@@ -1503,6 +1962,7 @@ def format_order_message(data: dict, lang: str = "ru") -> str:
 
 
 CUSTOM_EMOJI = {
+    "cutlery": "5382351125838077755",
     "welcome": "5384489194917765397",
     "point_down": "5382351125838077755",
     "profile_setup": "5384244502040975393",
@@ -1595,7 +2055,7 @@ I18N = {
         "courier_line_status_online": (
             f'{ce(CUSTOM_EMOJI["open_restaurant"], "🟢")} <b>На линии!</b> Заказы будут поступать.'
         ),
-        "btn_call_client": "Позвонить клиенту",
+        "btn_call_client": "Позвонить",
         "btn_whatsapp_client": "WhatsApp",
         "btn_telegram_client": "Telegram",
     },
@@ -2026,6 +2486,63 @@ async def send_courier_welcome(
     return msg
 
 
+async def _send_courier_shift_summary(chat_id: int, tg: int, lang: str = "ru"):
+    """Подсчитывает и отправляет итоги смены курьера за сегодня."""
+    courier_ids = await db.get_courier_ids_by_telegram(tg)
+    if not courier_ids:
+        return
+
+    def _query():
+        count = 0
+        fees = 0.0
+        tips = 0.0
+        for path in ORDER_DB_PATHS:
+            if not os.path.exists(path):
+                continue
+            conn = None
+            try:
+                conn = connect_sqlite_wal(path)
+                placeholders = ",".join("?" for _ in courier_ids)
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT count(*), coalesce(sum(delivery_fee), 0), coalesce(sum(tips), 0) "
+                    f"FROM orders WHERE courier_id IN ({placeholders}) "
+                    f"AND date(courier_taken_at) = date('now') "
+                    f"AND status = 'delivered'",
+                    tuple(courier_ids),
+                )
+                row = cur.fetchone()
+                if row:
+                    count += int(row[0] or 0)
+                    fees += float(row[1] or 0.0)
+                    tips += float(row[2] or 0.0)
+                break
+            except Exception as e:
+                log.warning("Shift summary query failed: %s", e)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return count, fees, tips
+
+    count, fees, tips = await asyncio.to_thread(_query)
+    if count > 0:
+        total = fees + tips
+        text = (
+            f'{ce("5384244502040975393", "🏁")} {t(lang, "shift_summary_title")}\n\n'
+            f'{ce("5384138412053796842", "📦")} {t(lang, "shift_summary_orders", n=count)}\n'
+            f'{ce("5384520939021048827", "💰")} {t(lang, "shift_summary_income", amount=f"{fees:.2f}")}\n'
+            f'{ce("5384518714227990146", "🎁")} {t(lang, "shift_summary_tips", amount=f"{tips:.2f}")}\n\n'
+            f'{ce("5384518714227990146", "💵")} {t(lang, "shift_summary_total", amount=f"{total:.2f}")}'
+        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("Failed to send shift summary to tg=%d: %s", tg, e)
+
+
 async def toggle_courier_line_status(tg_id: int, chat_id: int, user: dict) -> int:
     """Переключает online/offline курьера. Возвращает новый статус 0/1."""
     cancel_scheduled_courier_line_status(chat_id)
@@ -2051,6 +2568,8 @@ async def toggle_courier_line_status(tg_id: int, chat_id: int, user: dict) -> in
     await db.set_courier_online_status(tg_id, new_status)
     lang = user.get("language", "ru")
     await set_courier_reply_kb(chat_id, lang, new_status == 1)
+    if new_status == 0:
+        await _send_courier_shift_summary(chat_id, tg_id, lang)
     return new_status
 
 
@@ -2130,11 +2649,13 @@ async def notify_admin_restaurant_status_request(
 
 
 # Direct HTTPS URL for WebApp buttons (not t.me short link — that can point to stale Firebase).
-MINIAPP_DIRECT_URL = (
-    os.getenv("MINIAPP_URL", "https://mestidelivery.com").rstrip("/") + "/partners/"
-)
+_raw_miniapp = os.getenv("MINIAPP_URL", "https://partners.mestidelivery.com").rstrip("/")
+if "partners." in _raw_miniapp:
+    MINIAPP_DIRECT_URL = _raw_miniapp
+else:
+    MINIAPP_DIRECT_URL = _raw_miniapp + "/partners/"
 # Deep-link short name (BotFather Direct Link); prefer HTTPS for actual WebApp opens.
-MINIAPP_URL = "https://t.me/MestiDelivery_Robot/partners"
+MINIAPP_URL = "https://partners.mestidelivery.com"
 SUPPORT_BOT_URL = "https://t.me/MestigoSupport_Bot"
 
 
@@ -2592,12 +3113,14 @@ async def admin_payout_approve_callback(callback: CallbackQuery):
         
         partner_chat_id = None
         if role == "restaurant_admin":
-            async with db._db.execute("SELECT telegram_id FROM partners WHERE restaurant_id = ?", (partner_id,)) as cur:
-                row = await cur.fetchone()
-                if row:
-                    partner_chat_id = row[0]
+            partner = await db.get_partner_by_restaurant(partner_id)
+            if partner:
+                partner_chat_id = partner.get("telegram_id")
         else:
-            partner_chat_id = int(partner_id)
+            try:
+                partner_chat_id = int(partner_id)
+            except Exception:
+                pass
             
         if partner_chat_id:
             try:
@@ -2605,11 +3128,11 @@ async def admin_payout_approve_callback(callback: CallbackQuery):
                 lang = tg_user.get("language", "ru")
                 
                 if lang == "ru":
-                    notif = f"🔔 <b>Ваша заявка на выплату {amount:.2f} ₾ одобрена!</b>\nСредства отправлены и будут зачислены в ближайшее время."
+                    notif = f'{ce("5384244502040975393", "✅")} <b>Ваша заявка на выплату {amount:.2f} ₾ одобрена!</b>\nСредства отправлены и зачислены по вашим реквизитам.'
                 elif lang == "en":
-                    notif = f"🔔 <b>Your payout request for {amount:.2f} ₾ has been approved!</b>\nFunds have been sent and will be credited shortly."
+                    notif = f'{ce("5384244502040975393", "✅")} <b>Your payout request for {amount:.2f} ₾ has been approved!</b>\nFunds have been sent and will be credited shortly.'
                 else:
-                    notif = f"🔔 <b>თანხის გატანის მოთხოვნა {amount:.2f} ₾-ზე დამტკიცებულია!</b>\nთანხა გაგზავნილია და ჩაირიცხება უახლოეს დროში."
+                    notif = f'{ce("5384244502040975393", "✅")} <b>თანხის გატანის მოთხოვნა {amount:.2f} ₾-ზე დამტკიცებულია!</b>\nთანხა გაგზავნილია და ჩაირიცხება უახლოეს დროში.'
                     
                 await bot.send_message(chat_id=partner_chat_id, text=notif, parse_mode=ParseMode.HTML)
             except Exception as e:
@@ -2646,12 +3169,14 @@ async def admin_payout_reject_callback(callback: CallbackQuery):
         
         partner_chat_id = None
         if role == "restaurant_admin":
-            async with db._db.execute("SELECT telegram_id FROM partners WHERE restaurant_id = ?", (partner_id,)) as cur:
-                row = await cur.fetchone()
-                if row:
-                    partner_chat_id = row[0]
+            partner = await db.get_partner_by_restaurant(partner_id)
+            if partner:
+                partner_chat_id = partner.get("telegram_id")
         else:
-            partner_chat_id = int(partner_id)
+            try:
+                partner_chat_id = int(partner_id)
+            except Exception:
+                pass
             
         if partner_chat_id:
             try:
@@ -2659,11 +3184,11 @@ async def admin_payout_reject_callback(callback: CallbackQuery):
                 lang = tg_user.get("language", "ru")
                 
                 if lang == "ru":
-                    notif = f"⚠️ <b>Ваша заявка на выплату {amount:.2f} ₾ была отклонена администратором.</b>\nПожалуйста, обратитесь в поддержку для уточнения деталей."
+                    notif = f'{ce("5348083587532994863", "❌")} <b>Ваша заявка на выплату {amount:.2f} ₾ отклонена.</b>\nСредства возвращены на ваш баланс в боте.'
                 elif lang == "en":
-                    notif = f"⚠️ <b>Your payout request for {amount:.2f} ₾ has been rejected by admin.</b>\nPlease contact support for more details."
+                    notif = f'{ce("5348083587532994863", "❌")} <b>Your payout request for {amount:.2f} ₾ has been rejected.</b>\nThe amount has been returned to your balance.'
                 else:
-                    notif = f"⚠️ <b>თანხის გატანის მოთხოვნა {amount:.2f} ₾-ზე უარყოფილია ადმინისტრატორის მიერ.</b>\nდეტალებისთვის გთხოვთ მიმართოთ მხარდაჭერას."
+                    notif = f'{ce("5348083587532994863", "❌")} <b>თანხის გატანის მოთხოვნა {amount:.2f} ₾-ზე უარყოფილია.</b>\nთანხა დაბრუნებულია თქვენს ბალანსზე.'
                     
                 await bot.send_message(chat_id=partner_chat_id, text=notif, parse_mode=ParseMode.HTML)
             except Exception as e:
@@ -2703,7 +3228,51 @@ async def cmd_reset(message: Message, state: FSMContext):
     )
 
 
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext):
+    await state.clear()
+    tg = message.from_user.id
+    user = await db.get_bot_user(tg) or {}
+    if not user or not user.get("role"):
+        await cmd_start(message, state)
+        return
+    await render_and_send_profile(message.chat.id, None, tg, user)
+
+
+@router.message(Command("role"))
+async def cmd_role_switch(message: Message, state: FSMContext):
+    """Быстрое переключение роли аккаунта (ресторан / курьер) для тестов и основателя."""
+    await state.clear()
+    args = (message.text or "").split()
+    target_role = args[1].lower() if len(args) > 1 else ""
+    tg_id = message.from_user.id
+    user = await db.get_bot_user(tg_id)
+    if not user:
+        await message.answer("Сначала зарегистрируйтесь через /start")
+        return
+
+    current_role = user.get("role")
+    if target_role in ("courier", "курьер"):
+        new_role = "courier"
+    elif target_role in ("restaurant", "restaurant_admin", "ресторан"):
+        new_role = "restaurant_admin"
+    else:
+        new_role = "courier" if current_role == "restaurant_admin" else "restaurant_admin"
+
+    async with aiosqlite.connect(db.path) as conn:
+        await conn.execute("UPDATE bot_users SET role = ? WHERE telegram_id = ?", (new_role, tg_id))
+        await conn.commit()
+
+    role_label = "🛵 Курьер" if new_role == "courier" else "🏛️ Ресторан (Кухня)"
+    await message.answer(
+        f"✅ <b>Роль партнёра изменена на: {role_label}</b>\n\n"
+        f"Откройте Mini App — интерфейс и данные полностью адаптированы под эту роль.",
+        parse_mode=ParseMode.HTML
+    )
+
+
 @router.message(CommandStart())
+@router.message(Command("menu"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     
@@ -2758,6 +3327,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("lang_"))
 async def process_language(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     lang = callback.data.split("_")[1]
     await state.update_data(language=lang)
     await callback.message.edit_text(
@@ -2769,6 +3339,7 @@ async def process_language(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(RegistrationFlow.role, F.data.startswith("role_"))
 async def process_role(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     role = callback.data.split("_", 1)[1]
     await state.update_data(role=role)
     data = await state.get_data()
@@ -2848,6 +3419,11 @@ async def process_password(message: Message, state: FSMContext):
                     continue
                 conn = connect_sqlite_wal(path)
                 cursor = conn.cursor()
+                # Удаляем фантомных курьеров, созданных шлюзом для этого telegram_id
+                cursor.execute(
+                    "DELETE FROM admin_users WHERE username = ? OR (username LIKE 'courier_%' AND telegram_id = ?)",
+                    (f"courier_{tg_str}", tg_str),
+                )
                 cursor.execute(
                     "UPDATE admin_users SET telegram_id = NULL WHERE telegram_id = ?",
                     (tg_str,),
@@ -2858,7 +3434,7 @@ async def process_password(message: Message, state: FSMContext):
                 )
                 conn.commit()
                 conn.close()
-                log.info("Bound telegram_id=%s to username=%s in %s", tg_str, username, path)
+                log.info("Bound telegram_id=%s to username=%s in %s (cleaned phantoms)", tg_str, username, path)
             except Exception as e:
                 log.error("Failed binding telegram in %s: %s", path, e)
     if auth_success:
@@ -3260,24 +3836,49 @@ async def cmd_offline(message: Message):
 # ── Callback-кнопки ───────────────────────────
 
 # ── Вспомогательные функции для профиля ──
-def get_restaurant_profile_kb(is_open: bool, lang: str = "ru") -> InlineKeyboardMarkup:
+def get_restaurant_profile_kb(is_open: bool, lang: str = "ru", restaurant_id: str = "", rush_mode: int = 0) -> InlineKeyboardMarkup:
     if lang == "en":
         toggle_text = "Close restaurant" if is_open else "Open restaurant"
         hours_text = "Working hours"
         payouts_text = "Payouts"
+        stoplist_text = "Stop-list"
+        lang_text = "Change language"
         back_text = "← Back"
+        if rush_mode == 1:
+            rush_text = "🔥 Rush mode: ON"
+        elif rush_mode == -1:
+            rush_text = "🔥 Rush mode: OFF"
+        else:
+            rush_text = "🔥 Rush mode: Auto (18–22)"
     elif lang == "ka":
         toggle_text = "რესტორნის დახურვა" if is_open else "რესტორნის გახსნა"
         hours_text = "სამუშაო საათები"
         payouts_text = "გადახდები"
+        stoplist_text = "სტოპ-ლისტი"
+        lang_text = "ენის შეცვლა"
         back_text = "← უკან"
+        if rush_mode == 1:
+            rush_text = "🔥 პიკის საათი: ჩართ."
+        elif rush_mode == -1:
+            rush_text = "🔥 პიკის საათი: გამორთ."
+        else:
+            rush_text = "🔥 პიკის საათი: ავტო (18–22)"
     else:
         toggle_text = "Закрыть ресторан" if is_open else "Открыть ресторан"
         hours_text = "Часы работы"
         payouts_text = "Выплаты"
+        stoplist_text = "Стоп-лист"
+        lang_text = "Сменить язык"
         back_text = "← Назад"
+        if rush_mode == 1:
+            rush_text = "🔥 Запара: ВКЛ"
+        elif rush_mode == -1:
+            rush_text = "🔥 Запара: ВЫКЛ"
+        else:
+            rush_text = "🔥 Запара: Авто (18–22)"
 
     toggle_emoji = CUSTOM_EMOJI["close_restaurant"] if is_open else CUSTOM_EMOJI["open_restaurant"]
+    lang_emoji = "5384222159621102491"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3290,14 +3891,32 @@ def get_restaurant_profile_kb(is_open: bool, lang: str = "ru") -> InlineKeyboard
             ],
             [
                 InlineKeyboardButton(
+                    text=rush_text,
+                    callback_data="profile_toggle_rush",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=stoplist_text,
+                    icon_custom_emoji_id="5384312315279612142",
+                    callback_data=f"stoplist_open_{restaurant_id}",
+                ),
+                InlineKeyboardButton(
                     text=hours_text,
                     icon_custom_emoji_id=CUSTOM_EMOJI["hours"],
                     callback_data="profile_hours",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text=payouts_text,
                     icon_custom_emoji_id=CUSTOM_EMOJI["payouts"],
                     callback_data="profile_payouts",
+                ),
+                InlineKeyboardButton(
+                    text=lang_text,
+                    icon_custom_emoji_id=lang_emoji,
+                    callback_data="profile_change_language",
                 ),
             ],
             [
@@ -3314,6 +3933,8 @@ def get_courier_profile_kb(is_online: bool, lang: str = "ru") -> InlineKeyboardM
     toggle_icon = (
         CUSTOM_EMOJI["open_restaurant"] if is_online else CUSTOM_EMOJI["close_restaurant"]
     )
+    lang_text = "ენის შეცვლა" if lang == "ka" else ("Change language" if lang == "en" else "Сменить язык")
+    lang_emoji = "5384222159621102491"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -3330,8 +3951,53 @@ def get_courier_profile_kb(is_online: bool, lang: str = "ru") -> InlineKeyboardM
                     icon_custom_emoji_id="5384518714227990146",
                 ),
                 InlineKeyboardButton(
+                    text=lang_text,
+                    icon_custom_emoji_id=lang_emoji,
+                    callback_data="profile_change_language",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text=t(lang, "profile_back"),
                     callback_data="profile_back",
+                ),
+            ],
+        ]
+    )
+
+def get_language_switcher_kb(lang: str = "ru", back_callback: str = "profile_back") -> InlineKeyboardMarkup:
+    if lang == "ka":
+        back_text = "← უკან"
+    elif lang == "en":
+        back_text = "← Back"
+    else:
+        back_text = "← Назад"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="ქართული",
+                    icon_custom_emoji_id=CUSTOM_EMOJI["flag_ka"],
+                    callback_data="set_user_lang_ka",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Русский",
+                    icon_custom_emoji_id=CUSTOM_EMOJI["flag_ru"],
+                    callback_data="set_user_lang_ru",
+                ),
+                InlineKeyboardButton(
+                    text="English",
+                    icon_custom_emoji_id=CUSTOM_EMOJI["flag_en"],
+                    callback_data="set_user_lang_en",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=back_text,
+                    callback_data=back_callback,
                 ),
             ],
         ]
@@ -3389,9 +4055,9 @@ async def render_and_send_profile(chat_id: int, message_id: Optional[int], tg_id
         total_payouts = await db.get_restaurant_payouts(restaurant_id)
         balance = max(0.0, lifetime_income - total_payouts)
         active_n = await db.get_restaurant_active_orders(restaurant_id)
-        
+
         status_badge = "open" if is_open else "closed"
-        
+
         if lang == "ru":
             cap = (
                 f'{ce(CUSTOM_EMOJI["btn_profile"], "👤")} <b>Профиль ресторана</b>\n\n'
@@ -3410,8 +4076,9 @@ async def render_and_send_profile(chat_id: int, message_id: Optional[int], tg_id
                 f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>ბალანსი:</b> {balance:.2f} ₾\n'
                 f'{ce(CUSTOM_EMOJI["income_today"], "📈")} <b>დღევანდელი შემოსავალი:</b> {today_income:.2f} ₾'
             )
-            
-        kb = get_restaurant_profile_kb(is_open, lang)
+
+        rush_mode = await db.get_partner_rush_mode(restaurant_id)
+        kb = get_restaurant_profile_kb(is_open, lang, restaurant_id, rush_mode)
         
         fields = {
             "restaurant_name": name,
@@ -3485,7 +4152,7 @@ async def render_and_send_profile(chat_id: int, message_id: Optional[int], tg_id
             "rating": "5.0",
             # ON LINE запечён в Banner-6a для online; offline — через conditional.
             "status_badge": "online" if is_online else "offline",
-            "deliveries_count": t(lang, "banner_deliveries", n=deliveries_n),
+            "deliveries_count": f"{deliveries_n} {'delivery' if deliveries_n == 1 else 'deliveries'}",
             "earnings": _fmt_banner_lari(int(round(balance))),
         }
         
@@ -3537,35 +4204,70 @@ async def render_payouts_screen(chat_id: int, message_id: int, tg_id: int, user:
         last_payout_text = f"{last_payout['amount']:.2f} ₾ ({date_str}) ✅"
     else:
         last_payout_text = t(lang, "comment_none_short")
+
+    pending_req = await db.get_partner_pending_request(partner_id, role)
+    pending_line = ""
+    if pending_req:
+        p_amt = float(pending_req["amount"])
+        p_date = (pending_req.get("created_at") or "").split()[0]
+        p_id = pending_req.get("id")
+        if lang == "ru":
+            pending_line = f'\n{ce("5382351125838077755", "⏳")} <b>В обработке:</b> {p_amt:.2f} ₾ <i>(Заявка #{p_id} от {p_date})</i>'
+        elif lang == "en":
+            pending_line = f'\n{ce("5382351125838077755", "⏳")} <b>In processing:</b> {p_amt:.2f} ₾ <i>(Request #{p_id} from {p_date})</i>'
+        else:
+            pending_line = f'\n{ce("5382351125838077755", "⏳")} <b>დამუშავებაშია:</b> {p_amt:.2f} ₾ <i>(მოთხოვნა #{p_id})</i>'
         
     if lang == "ru":
         text = (
             f'{ce(CUSTOM_EMOJI["payouts"], "💳")} <b>Выплаты</b>\n\n'
-            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>Доступно к выводу:</b> {balance:.2f} ₾\n'
+            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>Доступно к выводу:</b> {balance:.2f} ₾'
+            f'{pending_line}\n'
             f'{ce(CUSTOM_EMOJI["hours"], "🕒")} <b>Последняя выплата:</b> {last_payout_text}'
         )
-        btn_request = "💸 Запросить выплату"
+        btn_request = "Запросить выплату"
         btn_back = t(lang, "profile_back")
     elif lang == "en":
         text = (
             f'{ce(CUSTOM_EMOJI["payouts"], "💳")} <b>Payouts</b>\n\n'
-            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>Available for withdrawal:</b> {balance:.2f} ₾\n'
+            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>Available for withdrawal:</b> {balance:.2f} ₾'
+            f'{pending_line}\n'
             f'{ce(CUSTOM_EMOJI["hours"], "🕒")} <b>Last payout:</b> {last_payout_text}'
         )
-        btn_request = "💸 Request payout"
+        btn_request = "Request payout"
         btn_back = t(lang, "profile_back")
     else:
         text = (
             f'{ce(CUSTOM_EMOJI["payouts"], "💳")} <b>გადახდები</b>\n\n'
-            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>გასატანად ხელმისაწვდომია:</b> {balance:.2f} ₾\n'
+            f'{ce(CUSTOM_EMOJI["balance"], "💰")} <b>გასატანად ხელმისაწვდომია:</b> {balance:.2f} ₾'
+            f'{pending_line}\n'
             f'{ce(CUSTOM_EMOJI["hours"], "🕒")} <b>ბოლო გადახდა:</b> {last_payout_text}'
         )
-        btn_request = "💸 თანხის გატანის მოთხოვნა"
+        btn_request = "თანხის გატანის მოთხოვნა"
         btn_back = t(lang, "profile_back")
         
     buttons = []
-    if balance > 0:
-        buttons.append([InlineKeyboardButton(text=btn_request, callback_data="payout_request_action")])
+    if balance > 0 and not pending_req:
+        buttons.append([
+            InlineKeyboardButton(
+                text=btn_request,
+                icon_custom_emoji_id="5384520939021048827",
+                callback_data="payout_request_action",
+            )
+        ])
+    elif pending_req:
+        p_label = {
+            "ru": f"Заявка #{pending_req['id']} в обработке",
+            "en": f"Request #{pending_req['id']} pending",
+            "ka": f"მოთხოვნა #{pending_req['id']} მუშავდება",
+        }.get(lang, "Заявка в обработке")
+        buttons.append([
+            InlineKeyboardButton(
+                text=p_label,
+                icon_custom_emoji_id="5382351125838077755",
+                callback_data="payout_pending_info",
+            )
+        ])
     buttons.append([InlineKeyboardButton(text=btn_back, callback_data="payout_back_to_profile")])
     
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -3701,6 +4403,100 @@ async def nav_profile(callback: CallbackQuery):
     user = await db.get_bot_user(tg) or {}
     await render_and_send_profile(callback.message.chat.id, callback.message.message_id, tg, user)
 
+
+@router.message(Command("lang"))
+@router.message(Command("language"))
+async def cmd_language(message: Message, state: FSMContext):
+    await state.clear()
+    lang = await user_lang(message.from_user.id)
+    kb = get_language_switcher_kb(lang=lang, back_callback="nav_profile")
+    if lang == "ka":
+        title = "აირჩიეთ ინტერფეისის ენა:"
+    elif lang == "en":
+        title = "Choose interface language:"
+    else:
+        title = "Выберите язык интерфейса:"
+    text = f'{ce("5384222159621102491", "🌐")} <b>{title}</b>'
+    await message.answer(
+        text,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data == "profile_change_language")
+async def on_profile_change_language(callback: CallbackQuery):
+    lang = await user_lang(callback.from_user.id)
+    kb = get_language_switcher_kb(lang=lang, back_callback="nav_profile")
+    if lang == "ka":
+        title = "აირჩიეთ ინტერფეისის ენა:"
+    elif lang == "en":
+        title = "Choose interface language:"
+    else:
+        title = "Выберите язык интерфейса:"
+    text = f'{ce("5384222159621102491", "🌐")} <b>{title}</b>'
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        try:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback.message.answer(
+                text=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_user_lang_"))
+async def on_set_user_language(callback: CallbackQuery, state: FSMContext):
+    new_lang = callback.data.split("_")[-1]  # ka, ru, en
+    tg_id = callback.from_user.id
+    await db.set_user_language(tg_id, new_lang)
+    await state.update_data(language=new_lang)
+
+    user = await db.get_bot_user(tg_id) or {}
+    role = user.get("role", "")
+
+    if role == "courier":
+        is_online = user.get("is_online", 0) == 1
+        await set_courier_reply_kb(tg_id, new_lang, is_online)
+
+    lang_names = {"ka": "ქართული", "ru": "Русский", "en": "English"}
+    alert_msgs = {
+        "ka": f"ენა შეიცვალა: {lang_names.get(new_lang, new_lang)}",
+        "ru": f"Язык изменён: {lang_names.get(new_lang, new_lang)}",
+        "en": f"Language changed: {lang_names.get(new_lang, new_lang)}",
+    }
+    await callback.answer(alert_msgs.get(new_lang, f"Язык: {new_lang}"), show_alert=True)
+
+    user["language"] = new_lang
+    if role:
+        await render_and_send_profile(callback.message.chat.id, callback.message.message_id, tg_id, user)
+    else:
+        await callback.message.edit_text(
+            get_text(new_lang, "choose_role"),
+            reply_markup=get_role_kb(new_lang),
+            parse_mode=ParseMode.HTML,
+        )
+
+
 @router.callback_query(F.data == "profile_toggle_status")
 async def profile_toggle_status(callback: CallbackQuery):
     tg = callback.from_user.id
@@ -3799,6 +4595,69 @@ async def profile_toggle_status(callback: CallbackQuery):
         await render_and_send_profile(callback.message.chat.id, callback.message.message_id, tg, user)
         cancel_scheduled_courier_line_status(callback.message.chat.id)
         await set_courier_reply_kb(callback.message.chat.id, lang, new_status == 1)
+
+
+@router.callback_query(F.data == "profile_toggle_rush")
+async def on_profile_toggle_rush(callback: CallbackQuery):
+    tg = callback.from_user.id
+    user = await db.get_bot_user(tg) or {}
+    role = user.get("role", "")
+    lang = user.get("language", "ru")
+
+    if role != "restaurant_admin":
+        await callback.answer()
+        return
+
+    partner = (
+        await db.get_partner_by_telegram(callback.message.chat.id)
+        or await db.get_partner_by_telegram(tg)
+        or {}
+    )
+    restaurant_id = partner.get("restaurant_id", "")
+    if not restaurant_id:
+        await callback.answer("Ресторан не найден", show_alert=True)
+        return
+
+    current_mode = await db.get_partner_rush_mode(restaurant_id)
+    # Cycle: 0 (Auto) -> 1 (ON) -> -1 (OFF) -> 0 (Auto)
+    if current_mode == 0:
+        new_mode = 1
+        msg = (
+            "🔥 Режим запары включён!\nНа странице оформления установлено время 45–65 мин и баннер часа пик."
+            if lang == "ru"
+            else (
+                "🔥 Rush mode ON!\nDelivery time set to 45–65 min with rush notice."
+                if lang == "en"
+                else "🔥 პიკის საათი ჩართულია!\nმიტანის დროა 45–65 წთ."
+            )
+        )
+    elif current_mode == 1:
+        new_mode = -1
+        msg = (
+            "Режим запары принудительно выключен (стандартное время 25–40 мин)."
+            if lang == "ru"
+            else (
+                "Rush mode forced OFF (standard 25–40 min)."
+                if lang == "en"
+                else "პიკის საათი გამორთულია (სტანდარტული 25–40 წთ)."
+            )
+        )
+    else:
+        new_mode = 0
+        msg = (
+            "Режим запары переведён в Авто (активен в вечерний час пик 18:00–22:00)."
+            if lang == "ru"
+            else (
+                "Rush mode set to Auto (active 18:00–22:00)."
+                if lang == "en"
+                else "პიკის საათი ავტო რეჟიმშია (18:00–22:00)."
+            )
+        )
+
+    await db.set_partner_rush_mode(restaurant_id, new_mode)
+    await callback.answer(msg, show_alert=True)
+    await render_and_send_profile(callback.message.chat.id, callback.message.message_id, tg, user)
+
 
 @router.callback_query(F.data == "profile_back")
 async def profile_back(callback: CallbackQuery, state: FSMContext):
@@ -3906,20 +4765,487 @@ async def payout_request_action(callback: CallbackQuery):
     if balance <= 0:
         await callback.answer(t(lang, "alert_balance_zero"), show_alert=True)
         return
-        
-    success = await db.create_payout_request(partner_id, role, balance)
-    if success:
-        if lang == "ru":
-            msg = f"✅ Заявка на {balance:.2f} ₾ отправлена. Мы обработаем её в ближайшее время."
-        elif lang == "en":
-            msg = f"✅ Request for {balance:.2f} ₾ sent. We will process it shortly."
+
+    # Защита от дублирования заявок (debounce / pending check)
+    pending = await db.get_pending_payout_requests()
+    if any(str(r.get("partner_id")) == str(partner_id) for r in pending):
+        dup_msg = {
+            "ru": "У вас уже есть активная заявка на вывод в обработке.",
+            "en": "You already have an active withdrawal request pending.",
+            "ka": "თქვენ უკვე გაქვთ აქტიური მოთხოვნა დამუშავების პროცესში.",
+        }.get(lang, "Заявка уже на рассмотрении.")
+        await callback.answer(dup_msg, show_alert=True)
+        return
+
+    req_id = await db.create_payout_request(partner_id, role, balance)
+    if req_id:
+        pname = ""
+        role_label = ""
+        if role == "restaurant_admin":
+            partner = (
+                await db.get_partner_by_telegram(callback.message.chat.id)
+                or await db.get_partner_by_telegram(tg)
+                or await db.get_partner_by_restaurant(partner_id)
+                or {}
+            )
+            pname = partner.get("restaurant_name") or user.get("backend_username") or partner_id
+            role_label = "Ресторан"
         else:
-            msg = f"✅ მოთხოვნა {balance:.2f} ₾-ზე გაგზავნილია. ჩვენ მას უახლოეს დროში დავამუშავებთ."
-            
-        await callback.answer(msg, show_alert=True)
+            pname = user.get("backend_username") or callback.from_user.full_name or f"Курьер {tg}"
+            role_label = "Курьер"
+
+        if ADMIN_TG_ID:
+            try:
+                from datetime import datetime as _dt
+                now_str = _dt.now().strftime("%d.%m.%Y %H:%M")
+                username_str = f"@{callback.from_user.username}" if callback.from_user.username else f"id: {tg}"
+                
+                admin_text = (
+                    f'{ce("5384520939021048827", "💰")} <b>Новая заявка на выплату #{req_id}!</b>\n\n'
+                    f'• <b>Партнёр:</b> {html.escape(str(pname))} ({role_label})\n'
+                    f'• <b>Сумма к выплате:</b> <code>{balance:.2f} ₾</code>\n'
+                    f'• <b>Telegram:</b> {username_str} (<code>{tg}</code>)\n'
+                    f'• <b>Дата:</b> {now_str}'
+                )
+                
+                admin_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=f"✅ Одобрить {balance:.2f} ₾",
+                                callback_data=f"admin_payout_direct_approve_{req_id}",
+                            ),
+                            InlineKeyboardButton(
+                                text="❌ Отклонить",
+                                callback_data=f"admin_payout_direct_reject_{req_id}",
+                            ),
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="Все заявки в панели",
+                                icon_custom_emoji_id="5384222159621102491",
+                                callback_data="admin_payouts",
+                            ),
+                        ],
+                    ]
+                )
+                
+                await bot.send_message(
+                    chat_id=int(ADMIN_TG_ID),
+                    text=admin_text,
+                    reply_markup=admin_kb,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                log.warning("Notify admin payout request failed: %s", e)
+
+        # 1. Popup alert
+        if lang == "ru":
+            alert_msg = f"✅ Заявка #{req_id} на {balance:.2f} ₾ принята!\nМы обработаем её в ближайшее время."
+        elif lang == "en":
+            alert_msg = f"✅ Request #{req_id} for {balance:.2f} ₾ accepted!\nWe will process it shortly."
+        else:
+            alert_msg = f"✅ მოთხოვნა #{req_id} ({balance:.2f} ₾) მიღებულია!\nდამუშავდება უახლოეს დროში."
+
+        await callback.answer(alert_msg, show_alert=True)
+
+        # 2. Confirmation message in partner's chat
+        try:
+            if lang == "ru":
+                conf_text = (
+                    f'{ce("5384244502040975393", "✅")} <b>Заявка на выплату #{req_id} отправлена!</b>\n\n'
+                    f'• <b>Сумма:</b> {balance:.2f} ₾\n'
+                    f'• <b>Статус:</b> В обработке\n\n'
+                    f'<i>Администратор уже получил уведомление. Обычно выплата занимает от 15 минут до нескольких часов. '
+                    f'Как только средства будут переведены, вы получите подтверждение здесь.</i>'
+                )
+            elif lang == "en":
+                conf_text = (
+                    f'{ce("5384244502040975393", "✅")} <b>Payout request #{req_id} sent!</b>\n\n'
+                    f'• <b>Amount:</b> {balance:.2f} ₾\n'
+                    f'• <b>Status:</b> In processing\n\n'
+                    f'<i>The administrator has received your request. You will be notified as soon as the funds are transferred.</i>'
+                )
+            else:
+                conf_text = (
+                    f'{ce("5384244502040975393", "✅")} <b>თანხის გატანის მოთხოვნა #{req_id} გაგზავნილია!</b>\n\n'
+                    f'• <b>თანხა:</b> {balance:.2f} ₾\n'
+                    f'• <b>სტატუსი:</b> დამუშავებაშია\n\n'
+                    f'<i>ადმინისტრატორს უკვე გაეგზავნა შეტყობინება. თანხის ჩარიცხვისთანავე მიიღებთ შეტყობინებას.</i>'
+                )
+            await bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=conf_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.warning("Sending partner payout confirmation message failed: %s", e)
+
         await render_payouts_screen(callback.message.chat.id, callback.message.message_id, tg, user)
     else:
         await callback.answer(t(lang, "alert_payout_error"), show_alert=True)
+
+
+@router.callback_query(F.data == "payout_pending_info")
+async def payout_pending_info(callback: CallbackQuery):
+    lang = await user_lang(callback.from_user.id)
+    msg = {
+        "ru": "Ваша заявка на выплату находится на рассмотрении у администратора. Средства поступят в ближайшее время.",
+        "en": "Your payout request is under review by the administrator. Funds will arrive shortly.",
+        "ka": "თქვენი მოთხოვნა განხილვის პროცესშია. თანხა ჩაირიცხება უახლოეს დროში.",
+    }.get(lang, "Заявка на рассмотрении.")
+    await callback.answer(msg, show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_payout_direct_approve_"))
+async def admin_payout_direct_approve_callback(callback: CallbackQuery):
+    is_admin = (callback.from_user.id == ADMIN_TG_ID) or (await db.is_super_admin(callback.from_user.id))
+    if not is_admin:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    req_id = int(callback.data.split("_")[-1])
+    req = await db.get_payout_request_by_id(req_id)
+    if not req:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+
+    if req.get("status") != "pending":
+        st = "одобрена" if req.get("status") == "approved" else "отклонена"
+        await callback.answer(f"Заявка #{req_id} уже была {st}!", show_alert=True)
+        return
+
+    success = await db.approve_payout_request(req_id)
+    if success:
+        await callback.answer(f"Заявка #{req_id} успешно одобрена!", show_alert=True)
+        
+        partner_id = req["partner_id"]
+        role = req["role"]
+        amount = req["amount"]
+        
+        partner_chat_id = None
+        pname = partner_id
+        if role == "restaurant_admin":
+            partner = await db.get_partner_by_restaurant(partner_id)
+            if partner:
+                partner_chat_id = partner.get("telegram_id")
+                pname = partner.get("restaurant_name") or partner_id
+        else:
+            try:
+                partner_chat_id = int(partner_id)
+                tg_user = await db.get_bot_user(partner_chat_id) or {}
+                pname = tg_user.get("backend_username") or f"Курьер {partner_id}"
+            except Exception:
+                pass
+            
+        if partner_chat_id:
+            try:
+                tg_user = await db.get_bot_user(partner_chat_id) or {}
+                lang = tg_user.get("language", "ru")
+                if lang == "ru":
+                    notif = (
+                        f'{ce("5384244502040975393", "✅")} <b>Выплата #{req_id} на сумму {amount:.2f} ₾ одобрена!</b>\n\n'
+                        f'Средства отправлены и зачислены по вашим платёжным реквизитам. Спасибо за работу!'
+                    )
+                elif lang == "en":
+                    notif = (
+                        f'{ce("5384244502040975393", "✅")} <b>Payout #{req_id} for {amount:.2f} ₾ approved!</b>\n\n'
+                        f'Funds have been sent to your account. Thank you!'
+                    )
+                else:
+                    notif = (
+                        f'{ce("5384244502040975393", "✅")} <b>გადახდა #{req_id} ({amount:.2f} ₾) დამტკიცებულია!</b>\n\n'
+                        f'თანხა ჩარიცხულია თქვენს ანგარიშზე. მადლობა თანამშრომლობისთვის!'
+                    )
+                await bot.send_message(chat_id=partner_chat_id, text=notif, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.warning(f"Failed sending payout approval notification to {partner_chat_id}: {e}")
+
+        from datetime import datetime as _dt
+        now_str = _dt.now().strftime("%d.%m.%Y %H:%M")
+        who = f"@{callback.from_user.username}" if callback.from_user.username else f"ID {callback.from_user.id}"
+        updated_text = (
+            f'{ce("5384244502040975393", "✅")} <b>Заявка на выплату #{req_id} ОДОБРЕНА!</b>\n\n'
+            f'• <b>Партнёр:</b> {html.escape(str(pname))}\n'
+            f'• <b>Сумма:</b> <code>{amount:.2f} ₾</code>\n'
+            f'• <b>Одобрил:</b> {who} ({now_str})\n'
+            f'• <b>Статус:</b> Выплачено ✅'
+        )
+        try:
+            await callback.message.edit_text(
+                text=updated_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="Все заявки в панели", icon_custom_emoji_id="5384222159621102491", callback_data="admin_payouts")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    else:
+        await callback.answer("Ошибка при одобрении заявки", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_payout_direct_reject_"))
+async def admin_payout_direct_reject_callback(callback: CallbackQuery):
+    is_admin = (callback.from_user.id == ADMIN_TG_ID) or (await db.is_super_admin(callback.from_user.id))
+    if not is_admin:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    req_id = int(callback.data.split("_")[-1])
+    req = await db.get_payout_request_by_id(req_id)
+    if not req:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+
+    if req.get("status") != "pending":
+        st = "одобрена" if req.get("status") == "approved" else "отклонена"
+        await callback.answer(f"Заявка #{req_id} уже была {st}!", show_alert=True)
+        return
+
+    success = await db.reject_payout_request(req_id)
+    if success:
+        await callback.answer(f"Заявка #{req_id} отклонена.", show_alert=True)
+        
+        partner_id = req["partner_id"]
+        role = req["role"]
+        amount = req["amount"]
+        
+        partner_chat_id = None
+        pname = partner_id
+        if role == "restaurant_admin":
+            partner = await db.get_partner_by_restaurant(partner_id)
+            if partner:
+                partner_chat_id = partner.get("telegram_id")
+                pname = partner.get("restaurant_name") or partner_id
+        else:
+            try:
+                partner_chat_id = int(partner_id)
+                tg_user = await db.get_bot_user(partner_chat_id) or {}
+                pname = tg_user.get("backend_username") or f"Курьер {partner_id}"
+            except Exception:
+                pass
+            
+        if partner_chat_id:
+            try:
+                tg_user = await db.get_bot_user(partner_chat_id) or {}
+                lang = tg_user.get("language", "ru")
+                if lang == "ru":
+                    notif = (
+                        f'{ce("5348083587532994863", "❌")} <b>Заявка на выплату #{req_id} ({amount:.2f} ₾) отклонена.</b>\n\n'
+                        f'Средства возвращены на ваш баланс в боте. Если у вас возникли вопросы, свяжитесь с поддержкой.'
+                    )
+                elif lang == "en":
+                    notif = (
+                        f'{ce("5348083587532994863", "❌")} <b>Payout request #{req_id} ({amount:.2f} ₾) was rejected.</b>\n\n'
+                        f'The amount has been returned to your balance. Please contact support if you have questions.'
+                    )
+                else:
+                    notif = (
+                        f'{ce("5348083587532994863", "❌")} <b>მოთხოვნა #{req_id} ({amount:.2f} ₾) უარყოფილია.</b>\n\n'
+                        f'თანხა დაბრუნებულია თქვენს ბალანსზე. კითხვების შემთხვევაში მიმართეთ ადმინისტრაციას.'
+                    )
+                await bot.send_message(chat_id=partner_chat_id, text=notif, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.warning(f"Failed sending payout reject notification to {partner_chat_id}: {e}")
+
+        from datetime import datetime as _dt
+        now_str = _dt.now().strftime("%d.%m.%Y %H:%M")
+        who = f"@{callback.from_user.username}" if callback.from_user.username else f"ID {callback.from_user.id}"
+        updated_text = (
+            f'{ce("5348083587532994863", "❌")} <b>Заявка на выплату #{req_id} ОТКЛОНЕНА</b>\n\n'
+            f'• <b>Партнёр:</b> {html.escape(str(pname))}\n'
+            f'• <b>Сумма:</b> <code>{amount:.2f} ₾</code>\n'
+            f'• <b>Отклонил:</b> {who} ({now_str})\n'
+            f'• <b>Статус:</b> Отклонено (баланс возвращён партнёру)'
+        )
+        try:
+            await callback.message.edit_text(
+                text=updated_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="Все заявки в панели", icon_custom_emoji_id="5384222159621102491", callback_data="admin_payouts")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    else:
+        await callback.answer("Ошибка при отклонении заявки", show_alert=True)
+
+
+async def send_stoplist_menu(chat_id: int, restaurant_id: str, lang: str = "ru", message_id: int | None = None):
+    """Меню быстрого стоп-листа для ресторана."""
+    def _fetch_dishes():
+        dishes = []
+        for path in CATALOG_DB_PATHS:
+            if not os.path.exists(path):
+                continue
+            conn = None
+            try:
+                conn = connect_sqlite_wal(path)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, name, is_available FROM products WHERE restaurant_id = ? ORDER BY name ASC LIMIT 40",
+                    (restaurant_id,),
+                )
+                dishes = cur.fetchall()
+                break
+            except Exception as e:
+                log.warning("Fetch dishes failed: %s", e)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return dishes
+
+    dishes = await asyncio.to_thread(_fetch_dishes)
+    if not dishes:
+        text = "ℹ️ В меню ресторана пока нет добавленных блюд."
+        if message_id:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "profile_back"), callback_data="profile_back")]]),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                await bot.send_message(chat_id=chat_id, text=text)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    text = f'{ce("5384312315279612142", "🍽")} {t(lang, "stoplist_title")}'
+    buttons = []
+    for dish_id, raw_name, is_avail in dishes:
+        name = _localize_item_name(raw_name, lang=lang) or "Блюдо"
+        emoji_id = "5348348011489542390" if is_avail == 1 else "5348083587532994863"
+        btn_text = name[:28]
+        buttons.append([
+            InlineKeyboardButton(
+                text=btn_text,
+                icon_custom_emoji_id=emoji_id,
+                callback_data=f"toggle_dish:{dish_id}:{restaurant_id}",
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text=t(lang, "profile_back"), callback_data="profile_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if message_id:
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("stoplist"))
+async def cmd_stoplist(message: Message):
+    tg = message.from_user.id
+    user = await db.get_bot_user(tg) or {}
+    lang = user.get("language", "ru")
+    partner = (
+        await db.get_partner_by_telegram(message.chat.id)
+        or await db.get_partner_by_telegram(tg)
+        or {}
+    )
+    rest_id = partner.get("restaurant_id", "")
+    if not rest_id:
+        await message.answer("⚠️ Команда доступна только для ресторанов.")
+        return
+    await send_stoplist_menu(message.chat.id, rest_id, lang)
+
+
+@router.callback_query(F.data.startswith("stoplist_open_"))
+async def on_stoplist_open(callback: CallbackQuery):
+    tg = callback.from_user.id
+    user = await db.get_bot_user(tg) or {}
+    if user.get("role") not in ("restaurant_admin", "admin") and not await db.is_super_admin(tg):
+        await callback.answer("⛔ Доступ разрешён только рестораторам.", show_alert=True)
+        return
+
+    await callback.answer()
+    rest_id = callback.data.replace("stoplist_open_", "")
+    lang = user.get("language", "ru")
+    if not rest_id:
+        partner = (
+            await db.get_partner_by_telegram(callback.message.chat.id)
+            or await db.get_partner_by_telegram(tg)
+            or {}
+        )
+        rest_id = partner.get("restaurant_id", "")
+    await send_stoplist_menu(callback.message.chat.id, rest_id, lang, message_id=callback.message.message_id)
+
+
+@router.callback_query(F.data.startswith("toggle_dish:"))
+async def on_toggle_dish(callback: CallbackQuery):
+    tg = callback.from_user.id
+    user = await db.get_bot_user(tg) or {}
+    if user.get("role") not in ("restaurant_admin", "admin") and not await db.is_super_admin(tg):
+        await callback.answer("⛔ Доступ разрешён только рестораторам.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    dish_id = parts[1]
+    rest_id = parts[2]
+    lang = await user_lang(tg)
+
+    def _toggle():
+        new_val = 0
+        dname = ""
+        for path in CATALOG_DB_PATHS:
+            if not os.path.exists(path):
+                continue
+            conn = None
+            try:
+                conn = connect_sqlite_wal(path)
+                cur = conn.cursor()
+                cur.execute("SELECT name, is_available FROM products WHERE id = ?", (dish_id,))
+                row = cur.fetchone()
+                if row:
+                    dname = row[0]
+                    new_val = 0 if row[1] == 1 else 1
+                    cur.execute("UPDATE products SET is_available = ? WHERE id = ?", (new_val, dish_id))
+                    conn.commit()
+                break
+            except Exception as e:
+                log.warning("Toggle dish failed: %s", e)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return new_val, dname
+
+    new_val, raw_name = await asyncio.to_thread(_toggle)
+    name = _localize_item_name(raw_name, lang=lang) or "Блюдо"
+    if new_val == 1:
+        alert = t(lang, "alert_dish_available", name=name)
+    else:
+        alert = t(lang, "alert_dish_stopped", name=name)
+
+    await callback.answer(alert, show_alert=False)
+    await send_stoplist_menu(callback.message.chat.id, rest_id, lang, message_id=callback.message.message_id)
 
 @router.callback_query(F.data == "profile_hours")
 async def profile_hours(callback: CallbackQuery):
@@ -4075,11 +5401,11 @@ async def edit_field_name_callback(callback: CallbackQuery, state: FSMContext):
     )
     
     if lang == "ru":
-        prompt = "📝 <b>Введите новое название ресторана:</b>"
+        prompt = f'{ce("5384244502040975393", "📝")} <b>Введите новое название ресторана:</b>'
     elif lang == "en":
-        prompt = "📝 <b>Enter new restaurant name:</b>"
+        prompt = f'{ce("5384244502040975393", "📝")} <b>Enter new restaurant name:</b>'
     else:
-        prompt = "📝 <b>შეიყვანეთ რესტორნის ახალი სახელი:</b>"
+        prompt = f'{ce("5384244502040975393", "📝")} <b>შეიყვანეთ რესტორნის ახალი სახელი:</b>'
         
     prompt_msg = await callback.message.reply(prompt, parse_mode=ParseMode.HTML)
     await state.update_data(prompt_msg_id=prompt_msg.message_id)
@@ -4105,11 +5431,11 @@ async def edit_field_desc_callback(callback: CallbackQuery, state: FSMContext):
     )
     
     if lang == "ru":
-        prompt = "📋 <b>Введите новое описание ресторана:</b>"
+        prompt = f'{ce("5384138412053796842", "📋")} <b>Введите новое описание ресторана:</b>'
     elif lang == "en":
-        prompt = "📋 <b>Enter new restaurant description:</b>"
+        prompt = f'{ce("5384138412053796842", "📋")} <b>Enter new restaurant description:</b>'
     else:
-        prompt = "📋 <b>შეიყვანეთ რესტორნის ახალი აღწერა:</b>"
+        prompt = f'{ce("5384138412053796842", "📋")} <b>შეიყვანეთ რესტორნის ახალი აღწერა:</b>'
         
     prompt_msg = await callback.message.reply(prompt, parse_mode=ParseMode.HTML)
     await state.update_data(prompt_msg_id=prompt_msg.message_id)
@@ -4135,11 +5461,11 @@ async def edit_field_photo_callback(callback: CallbackQuery, state: FSMContext):
     )
     
     if lang == "ru":
-        prompt = "🖼️ <b>Отправьте новую фотографию для ресторана (одним сообщением):</b>"
+        prompt = f'{ce("5384312315279612142", "🖼")} <b>Отправьте новую фотографию для ресторана (одним сообщением):</b>'
     elif lang == "en":
-        prompt = "🖼️ <b>Send a new photo for the restaurant (single message):</b>"
+        prompt = f'{ce("5384312315279612142", "🖼")} <b>Send a new photo for the restaurant (single message):</b>'
     else:
-        prompt = "🖼️ <b>გამოაგზავნეთ რესტორნის ახალი ფოტო (ერთი შეტყობინებით):</b>"
+        prompt = f'{ce("5384312315279612142", "🖼")} <b>გამოაგზავნეთ რესტორნის ახალი ფოტო (ერთი შეტყობინებით):</b>'
         
     prompt_msg = await callback.message.reply(prompt, parse_mode=ParseMode.HTML)
     await state.update_data(prompt_msg_id=prompt_msg.message_id)
@@ -4269,18 +5595,37 @@ async def edit_photo_input_handler(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("accept_"))
 async def on_accept(callback: CallbackQuery):
+    tg_user = await db.get_bot_user(callback.from_user.id) or {}
+    if tg_user.get("role") not in ("restaurant_admin", "admin") and not await db.is_super_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ разрешён только рестораторам.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_", 1)[1])
     telegram_id = callback.message.chat.id
     lang = await user_lang(telegram_id)
 
     log.info("Order #%d accepted by partner tg=%d", order_id, telegram_id)
+    cancel_restaurant_accept_reminders(order_id)
 
     # Обновляем бэкенд
     success = await update_order_status_backend(order_id, "accepted")
 
     if success:
-
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t(lang, "btn_prep_10"),
+                    callback_data=f"prep_time:10:{order_id}",
+                ),
+                InlineKeyboardButton(
+                    text=t(lang, "btn_prep_15"),
+                    callback_data=f"prep_time:15:{order_id}",
+                ),
+                InlineKeyboardButton(
+                    text=t(lang, "btn_prep_20"),
+                    callback_data=f"prep_time:20:{order_id}",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text=t(lang, "btn_start_cooking"),
@@ -4299,13 +5644,93 @@ async def on_accept(callback: CallbackQuery):
             show_alert=True,
         )
 
+@router.callback_query(F.data.startswith("prep_time:"))
+async def on_prep_time(callback: CallbackQuery):
+    tg_user = await db.get_bot_user(callback.from_user.id) or {}
+    if tg_user.get("role") not in ("restaurant_admin", "admin") and not await db.is_super_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ разрешён только рестораторам.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    minutes = int(parts[1])
+    order_id = int(parts[2])
+    telegram_id = callback.message.chat.id
+    lang = await user_lang(telegram_id)
+
+    log.info("Order #%d prep time set to %d min by partner tg=%d", order_id, minutes, telegram_id)
+    cancel_restaurant_accept_reminders(order_id)
+
+    # Сохраняем delay_minutes в order.db
+    for path in ORDER_DB_PATHS:
+        if os.path.exists(path):
+            try:
+                conn = connect_sqlite_wal(path)
+                conn.execute(
+                    "UPDATE orders SET delay_minutes = ? WHERE id = ?",
+                    (minutes, order_id),
+                )
+                conn.commit()
+                conn.close()
+                break
+            except Exception as e:
+                log.warning("Save prep time failed order=%d: %s", order_id, e)
+
+    await update_order_status_backend(order_id, "preparing")
+    await db.update_order_status(order_id, telegram_id, "preparing")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=t(lang, "btn_ready_for_pickup"),
+                callback_data=f"ready_{order_id}",
+                style=ButtonStyle.SUCCESS,
+                icon_custom_emoji_id="5384312315279612142",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=t(lang, "btn_open_details"),
+                web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                icon_custom_emoji_id="5384138412053796842",
+            ),
+        ],
+    ])
+
+    # Обновляем заголовок карточки с таймингом готовности (UTC+4 Тбилиси)
+    now_tb = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
+    ready_time = (now_tb + datetime.timedelta(minutes=minutes)).strftime("%H:%M")
+    order_row = _get_order_row(order_id)
+    prep_caption = format_order_message(
+        order_row or {"order_id": order_id},
+        lang=lang,
+        status="preparing",
+        ready_time=ready_time,
+    )
+    try:
+        await callback.message.edit_caption(
+            caption=prep_caption,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e_edit:
+        log.warning("edit caption on_prep_time failed order=%s: %s", order_id, e_edit)
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+
+    await callback.answer(t(lang, "alert_prep_time_set", n=minutes), show_alert=True)
+
 @router.callback_query(F.data.startswith("prepare_"))
 async def on_prepare(callback: CallbackQuery):
+    tg_user = await db.get_bot_user(callback.from_user.id) or {}
+    if tg_user.get("role") not in ("restaurant_admin", "admin") and not await db.is_super_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ разрешён только рестораторам.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_", 1)[1])
     telegram_id = callback.message.chat.id
     lang = await user_lang(telegram_id)
 
     log.info("Order #%d preparation started by partner tg=%d", order_id, telegram_id)
+    cancel_restaurant_accept_reminders(order_id)
 
     success = await update_order_status_backend(order_id, "preparing")
 
@@ -4318,9 +5743,29 @@ async def on_prepare(callback: CallbackQuery):
                     style=ButtonStyle.SUCCESS,
                     icon_custom_emoji_id="5384312315279612142",
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t(lang, "btn_open_details"),
+                    web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                    icon_custom_emoji_id="5384138412053796842",
+                ),
+            ],
         ])
-        await callback.message.edit_reply_markup(reply_markup=keyboard)
+        order_row = _get_order_row(order_id)
+        prep_caption = format_order_message(
+            order_row or {"order_id": order_id},
+            lang=lang,
+            status="preparing",
+        )
+        try:
+            await callback.message.edit_caption(
+                caption=prep_caption,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
         await callback.answer(t(lang, "alert_rest_preparing"), show_alert=True)
         await db.update_order_status(order_id, telegram_id, "preparing")
     else:
@@ -4333,11 +5778,32 @@ async def on_ready(callback: CallbackQuery):
     lang = await user_lang(telegram_id)
 
     log.info("Order #%d ready by partner tg=%d", order_id, telegram_id)
+    cancel_restaurant_accept_reminders(order_id)
 
     success = await update_order_status_backend(order_id, "ready")
 
     if success:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        ready_details_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=t(lang, "btn_open_details"),
+                web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                icon_custom_emoji_id="5384138412053796842",
+            ),
+        ]])
+        order_row = _get_order_row(order_id)
+        ready_caption = format_order_message(
+            order_row or {"order_id": order_id},
+            lang=lang,
+            status="ready",
+        )
+        try:
+            await callback.message.edit_caption(
+                caption=ready_caption,
+                reply_markup=ready_details_kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback.message.edit_reply_markup(reply_markup=ready_details_kb)
         await callback.answer(t(lang, "alert_rest_ready"), show_alert=True)
         await db.update_order_status(order_id, telegram_id, "ready")
         # Подсказка назначенному курьеру: можно забирать.
@@ -5433,11 +6899,20 @@ def maps_nav_url(
     lng: float | None = None,
     address: str = "",
 ) -> str | None:
-    """Ссылка навигации Google Maps по адресу (координаты из БД часто кривые — не используем)."""
-    del lat, lng  # reserved; coords intentionally ignored
+    """Ссылка навигации Google Maps по адресу с гео-привязкой к Местии."""
+    if lat is not None and lng is not None:
+        try:
+            flat, flng = float(lat), float(lng)
+            if abs(flat) > 0.1 and abs(flng) > 0.1:
+                return f"https://maps.google.com/?q={flat:.6f},{flng:.6f}"
+        except (TypeError, ValueError):
+            pass
     addr = (address or "").strip()
     if not addr or addr == "—":
         return None
+    # Добавляем Mestia для 100% точного геопозиционирования в картах
+    if "mestia" not in addr.lower() and "მესტია" not in addr:
+        addr = f"{addr}, Mestia"
     return f"https://www.google.com/maps/dir/?api=1&destination={quote(addr)}"
 
 
@@ -5447,11 +6922,13 @@ def html_maps_link(
     lat: float | None = None,
     lng: float | None = None,
     address: str = "",
+    search_query: str = "",
 ) -> str:
     """Текст адреса как кликабельная ссылка на карты; без URL — обычный escape."""
     label = (text or "").strip() or "—"
     safe = html.escape(label)
-    url = maps_nav_url(address=address or label)
+    query = search_query or address or label
+    url = maps_nav_url(lat=lat, lng=lng, address=query)
     if not url:
         return safe
     return f'<a href="{html.escape(url, quote=True)}">{safe}</a>'
@@ -5490,8 +6967,66 @@ _ADDRESS_LOCALE_RULES: list[tuple[re.Pattern[str], dict[str, str]]] = [
         {"en": "Vittorio Sella St", "ka": "ვიტორიო სელას ქუჩა"},
     ),
     (
-        re.compile(r"ул\.?\s*кахиани|кахиани|kakhiani", re.I),
-        {"en": "Kakhiani St", "ka": "კახიანის ქუჩა"},
+        re.compile(r"ул\.?\s*бетлеми|бетлеми|betlemi|bethlehem", re.I),
+        {"en": "Betlemi St", "ka": "ბეთლემის ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:зураб[аы]?\s*)?церетели|(?:зураб[аы]?\s*)?церетели|zurab\s*tsereteli|tsereteli",
+            re.I,
+        ),
+        {"en": "Zurab Tsereteli St", "ka": "ზურაბ წერეთლის ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:борис[аы]?\s*)?кахиани|(?:борис[аы]?\s*)?кахиани|kakhiani",
+            re.I,
+        ),
+        {"en": "Boris Kakhiani St", "ka": "ბორის კახიანის ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:шота\s*)?руставели|(?:шота\s*)?руставели|rustaveli",
+            re.I,
+        ),
+        {"en": "Rustaveli St", "ka": "რუსთაველის ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:михеил[аы]?\s*|михаил[аы]?\s*)?хергиани|хергиани|khergiani",
+            re.I,
+        ),
+        {"en": "Mikheil Khergiani St", "ka": "მიხეილ ხერგიანის ქუჩა"},
+    ),
+    (
+        re.compile(r"ул\.?\s*ланчвали|ланчвали|lanchvali", re.I),
+        {"en": "Lanchvali St", "ka": "ლანჩვალის ქუჩა"},
+    ),
+    (
+        re.compile(r"ул\.?\s*лехтаги|лехтаги|lekhtagi", re.I),
+        {"en": "Lekhtagi St", "ka": "ლეხთაგის ქუჩა"},
+    ),
+    (
+        re.compile(r"ул\.?\s*лагами|лагами|laghami", re.I),
+        {"en": "Laghami St", "ka": "ლაღამის ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:мераб[аы]?\s*)?костава|костава|kostava",
+            re.I,
+        ),
+        {"en": "Kostava St", "ka": "კოსტავას ქუჩა"},
+    ),
+    (
+        re.compile(
+            r"ул\.?\s*(?:илья?\s*)?чавчавадзе|чавчавадзе|chavchavadze",
+            re.I,
+        ),
+        {"en": "Chavchavadze St", "ka": "ჭავჭავაძის ქუჩა"},
+    ),
+    (
+        re.compile(r"ул\.?\s*арах?ишвили|арах?ишвили|arakhishvili", re.I),
+        {"en": "Arakhishvili St", "ka": "არახიშვილის ქუჩა"},
     ),
     (
         re.compile(r"ул\.?\s*лестничн\w*|лестничн\w*\s*ул\.?|ladder\s*st", re.I),
@@ -5547,6 +7082,19 @@ _ADDRESS_TOKEN_MAP: list[tuple[re.Pattern[str], dict[str, str]]] = [
     (re.compile(r"\bцентр\b", re.I), {"en": "center", "ka": "ცენტრი"}),
 ]
 
+_CYRILLIC_TO_LATIN = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+    'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
+    'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
+    'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
+    'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Shch',
+    'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya',
+}
+
 
 def _address_locale_key(lang: str) -> str:
     return "ka" if (lang or "").startswith("ka") else "en"
@@ -5571,6 +7119,9 @@ def localize_address_for_courier(address: str, lang: str = "ru") -> str:
         out = pat.sub(_repl, out)
     for pat, forms in _ADDRESS_TOKEN_MAP:
         out = pat.sub(forms.get(loc) or forms["en"], out)
+    # Транслитерация оставшейся кириллицы при переводе на английский
+    if loc == "en" and re.search(r"[а-яА-ЯёЁ]", out):
+        out = "".join(_CYRILLIC_TO_LATIN.get(c, c) for c in out)
     # подчистить двойные пробелы/запятые после замен
     out = re.sub(r"\s{2,}", " ", out)
     out = re.sub(r"\s*,\s*,+", ", ", out)
@@ -5605,6 +7156,8 @@ def _fetch_order_map_points_sync(order_id: int) -> dict:
         "dropoff_lat": None,
         "dropoff_lng": None,
         "restaurant_id": "",
+        "restaurant_name": "",
+        "restaurant_address": "",
     }
     restaurant_id = ""
     for path in ORDER_DB_PATHS:
@@ -5648,6 +7201,8 @@ def _fetch_order_map_points_sync(order_id: int) -> dict:
                     continue
                 addr = (str(row[0] or "")).strip()
                 name = (str(row[3] or "")).strip()
+                out["restaurant_name"] = name
+                out["restaurant_address"] = addr
                 out["pickup_address"] = addr or name
                 out["pickup_lat"] = _coerce_coord(row[1])
                 out["pickup_lng"] = _coerce_coord(row[2])
@@ -5731,34 +7286,47 @@ def is_georgian_phone(phone: str) -> bool:
 
 
 def _courier_contact_row(phone: str, lang: str, order_id: int) -> list[InlineKeyboardButton] | None:
-    """Грузинский номер — callback «Позвонить клиенту»; иностранный — WhatsApp + Telegram."""
+    """Кнопки связи с клиентом (Звонок / WhatsApp)."""
     digits = normalize_phone_digits(phone)
-    if not digits:
-        return None
-    if is_georgian_phone(phone):
-        return [
-            InlineKeyboardButton(
-                text=get_text(lang, "btn_call_client"),
-                callback_data=f"cr_call_{order_id}",
-                icon_custom_emoji_id=CONTACT_EMOJI_PHONE,
+    buttons: list[InlineKeyboardButton] = []
+
+    if digits:
+        call_text = get_text(lang, "btn_call_client") or "Позвонить"
+        if is_georgian_phone(phone):
+            buttons.append(
+                InlineKeyboardButton(
+                    text=call_text,
+                    callback_data=f"cr_call_{order_id}",
+                    icon_custom_emoji_id=CONTACT_EMOJI_PHONE,
+                )
             )
-        ]
-    return [
-        InlineKeyboardButton(
-            text=get_text(lang, "btn_whatsapp_client"),
-            url=f"https://wa.me/{digits}",
-            icon_custom_emoji_id=CONTACT_EMOJI_WHATSAPP,
-        ),
-        InlineKeyboardButton(
-            text=get_text(lang, "btn_telegram_client"),
-            url=f"tg://resolve?phone={digits}",
-            icon_custom_emoji_id=CONTACT_EMOJI_TELEGRAM,
-        ),
-    ]
+            buttons.append(
+                InlineKeyboardButton(
+                    text=get_text(lang, "btn_whatsapp_client"),
+                    url=f"https://wa.me/{digits}",
+                    icon_custom_emoji_id=CONTACT_EMOJI_WHATSAPP,
+                )
+            )
+        else:
+            buttons.append(
+                InlineKeyboardButton(
+                    text=get_text(lang, "btn_whatsapp_client"),
+                    url=f"https://wa.me/{digits}",
+                    icon_custom_emoji_id=CONTACT_EMOJI_WHATSAPP,
+                )
+            )
+            buttons.append(
+                InlineKeyboardButton(
+                    text=get_text(lang, "btn_telegram_client"),
+                    url=f"tg://resolve?phone={digits}",
+                    icon_custom_emoji_id=CONTACT_EMOJI_TELEGRAM,
+                )
+            )
+    return buttons if buttons else None
 
 
 def _courier_status_button(action: str, order_id: int, lang: str = "ru") -> InlineKeyboardButton | None:
-    if action == "arrived_restaurant":
+    if action in ("arrived_restaurant", "accepted"):
         return InlineKeyboardButton(
             text=t(lang, "btn_courier_arrived_rest"),
             callback_data=f"mesti_arrived_restaurant_{order_id}",
@@ -5772,7 +7340,7 @@ def _courier_status_button(action: str, order_id: int, lang: str = "ru") -> Inli
             style=ButtonStyle.SUCCESS,
             icon_custom_emoji_id="5384312315279612142",
         )
-    if action in ("completed", "arrived"):
+    if action in ("completed", "arrived", "delivering"):
         return InlineKeyboardButton(
             text=t(lang, "btn_courier_delivered"),
             callback_data=f"mesti_completed_{order_id}",
@@ -5790,7 +7358,7 @@ def build_courier_tracking_keyboard(
     lang: str = "ru",
     show_contact: bool = True,
 ) -> InlineKeyboardMarkup | None:
-    """Зелёная кнопка статуса сверху; контакт клиента — строкой ниже."""
+    """Зелёная кнопка статуса сверху; контакт клиента — строкой ниже; кнопка Подробнее."""
     status_btn = _courier_status_button(action, order_id, lang=lang)
     rows: list[list[InlineKeyboardButton]] = []
     if status_btn:
@@ -5804,8 +7372,14 @@ def build_courier_tracking_keyboard(
         except Exception as e:
             log.warning("courier contact row failed order=%s: %s", order_id, e)
 
-    if not rows:
-        return None
+    rows.append([
+        InlineKeyboardButton(
+            text=t(lang, "btn_open_details"),
+            web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+            icon_custom_emoji_id="5384138412053796842",
+        )
+    ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -5904,6 +7478,85 @@ async def on_ignore_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+async def get_order_complete_fields(order_id: int) -> dict:
+    """Гарантированно возвращает полные данные заказа (ресторан, адреса, тарифы)."""
+    fields = dict(await load_courier_broadcast_fields(int(order_id)))
+
+    need_restaurant = not fields.get("restaurant_name") or not fields.get("pickup_address")
+    need_dropoff = not (fields.get("dropoff_address") or fields.get("delivery_address"))
+    need_financials = not fields.get("fee")
+    need_accepted = not fields.get("accepted_at")
+
+    if need_restaurant or need_dropoff or need_financials or need_accepted:
+        def _read_dbs():
+            res = {}
+            for p in ORDER_DB_PATHS:
+                if not os.path.exists(p):
+                    continue
+                try:
+                    conn = connect_sqlite_wal(p)
+                    conn.row_factory = sqlite3.Row
+                    r = conn.execute("SELECT * FROM orders WHERE id = ?", (int(order_id),)).fetchone()
+                    conn.close()
+                    if r:
+                        row_d = dict(r)
+                        addr = row_d.get("address") or ""
+                        res["dropoff_address"] = addr
+                        res["delivery_address"] = addr
+                        res["fee"] = float(row_d.get("delivery_fee") or 0.0)
+                        res["tips"] = float(row_d.get("tips") or 0.0)
+                        res["comment"] = row_d.get("comment") or ""
+                        res["currency"] = "GEL"
+                        res["created_at"] = row_d.get("created_at")
+                        res["accepted_at"] = row_d.get("courier_taken_at") or row_d.get("courier_confirmed_at")
+                        res["courier_taken_at"] = row_d.get("courier_taken_at")
+                        res["dropoff_lat"] = row_d.get("delivery_lat")
+                        res["dropoff_lng"] = row_d.get("delivery_lng")
+                        res["restaurant_id"] = str(row_d.get("restaurant_id") or "")
+                        break
+                except Exception as ex:
+                    log.warning("get_order_complete_fields order.db err: %s", ex)
+
+            rest_id = res.get("restaurant_id")
+            if rest_id:
+                for cp in CATALOG_DB_PATHS:
+                    if not os.path.exists(cp):
+                        continue
+                    try:
+                        conn = connect_sqlite_wal(cp)
+                        conn.row_factory = sqlite3.Row
+                        r = conn.execute("SELECT name, address, latitude, longitude FROM restaurants WHERE id = ?", (str(rest_id),)).fetchone()
+                        conn.close()
+                        if r:
+                            res["restaurant_name"] = r["name"] or ""
+                            res["pickup_address"] = r["address"] or ""
+                            res["pickup_lat"] = r["latitude"]
+                            res["pickup_lng"] = r["longitude"]
+                            break
+                    except Exception as ex:
+                        log.warning("get_order_complete_fields catalog.db err: %s", ex)
+
+            if not res.get("distance_km") and res.get("pickup_lat") and res.get("dropoff_lat"):
+                try:
+                    import math
+                    R = 6371.0
+                    dlat = math.radians(res["dropoff_lat"] - res["pickup_lat"])
+                    dlng = math.radians(res["dropoff_lng"] - res["pickup_lng"])
+                    a = math.sin(dlat / 2)**2 + math.cos(math.radians(res["pickup_lat"])) * math.cos(math.radians(res["dropoff_lat"])) * math.sin(dlng / 2)**2
+                    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                    res["distance_km"] = round(R * c * 1.25, 1)
+                except Exception:
+                    pass
+            return res
+
+        db_fields = await asyncio.to_thread(_read_dbs)
+        for k, v in db_fields.items():
+            if not fields.get(k) and v:
+                fields[k] = v
+
+    return fields
+
+
 @router.callback_query(F.data.startswith("mesti_"))
 async def on_mesti_callback(callback: CallbackQuery):
     data = callback.data
@@ -5928,6 +7581,40 @@ async def on_mesti_callback(callback: CallbackQuery):
             t(lang, "alert_refuse_confirm", order_id=order_id),
             show_alert=True,
         )
+        return
+
+    # Проверка статуса заказа в базе: если уже доставлен или уже в доставке
+    cur_status = get_order_current_status(int(order_id))
+    if cur_status in ("delivered", "completed"):
+        await callback.answer(
+            t(lang, "alert_order_already_delivered", order_id=order_id),
+            show_alert=True,
+        )
+        done_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=t(lang, "btn_open_details"),
+                web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                icon_custom_emoji_id="5384138412053796842",
+            )
+        ]])
+        try:
+            await callback.message.edit_reply_markup(reply_markup=done_kb)
+        except Exception:
+            pass
+        return
+
+    if action == "arrived_restaurant" and cur_status == "delivering":
+        await callback.answer(
+            t(lang, "alert_already_picked_up", order_id=order_id),
+            show_alert=True,
+        )
+        cached = _COURIER_BROADCAST_FIELDS.get(int(order_id), {})
+        phone = await resolve_courier_contact_phone(int(order_id), cached.get("phone") or "")
+        delivering_kb = build_courier_tracking_keyboard("completed", order_id, phone=phone, lang=lang)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=delivering_kb)
+        except Exception:
+            pass
         return
 
     # Лоадер, чтобы избежать дабл-кликов
@@ -6062,6 +7749,31 @@ async def on_mesti_callback(callback: CallbackQuery):
         else None
     )
 
+    # Отменяем напоминания SLA для курьера при принятии/продвижении заказа
+    cancel_courier_assign_reminders(int(order_id))
+
+    if action == "accepted":
+        now_geo = datetime.now(GEORGIA_TZ).isoformat()
+        _COURIER_BROADCAST_FIELDS.setdefault(int(order_id), {})["accepted_at"] = now_geo
+        if db is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    db.upsert_courier_broadcast_cache(
+                        int(order_id), _COURIER_BROADCAST_FIELDS[int(order_id)]
+                    )
+                )
+            except Exception:
+                pass
+
+    next_kb_action = next_action
+    if action == "accepted" and not next_kb_action:
+        next_kb_action = "arrived_restaurant"
+    elif action == "arrived_restaurant" and not next_kb_action:
+        next_kb_action = "picked_up"
+    elif action == "picked_up" and not next_kb_action:
+        next_kb_action = "completed"
+
     if next_kb_action:
         await apply_courier_tracking_keyboard(
             callback.message,
@@ -6072,25 +7784,271 @@ async def on_mesti_callback(callback: CallbackQuery):
             fallback_markup=original_kb,
         )
     else:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception as e:
-            log.warning("Webhook: clear reply_markup failed: %s", e)
+        # Заказ доставлен — переводим карточку в статус завершённого и убираем кнопки действий
+        done_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=t(lang, "btn_open_details"),
+                web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                icon_custom_emoji_id="5384138412053796842",
+            )
+        ]])
 
-    await edit_courier_tracking_caption(
-        chat_id=telegram_id,
-        message_id=callback.message.message_id,
-        order_id=order_id,
-        lang=lang,
-        next_action=next_kb_action,
-        last_action=action,
-        current_status=str(resp_data.get("current_status") or ""),
-    )
+        cached_fields = await get_order_complete_fields(int(order_id))
+        accepted_at_val = cached_fields.get("accepted_at") or cached_fields.get("courier_taken_at")
+        accepted_hm = _format_georgia_time(accepted_at_val or cached_fields.get("created_at"))
+
+        if lang == "ka":
+            header_line = f'{ce("5384244502040975393", "✅")} <b>შეკვეთა #{order_id} დასრულებულია</b>'
+        elif lang == "ru":
+            header_line = f'{ce("5384244502040975393", "✅")} <b>ЗАКАЗ #{order_id} ЗАВЕРШЁН</b>'
+        else:
+            header_line = f'{ce("5384244502040975393", "✅")} <b>ORDER #{order_id} COMPLETED</b>'
+
+        # Формируем карточку курьера с полным набором фирменных tg-emoji
+        new_caption = format_broadcast_text(
+            order_id=order_id,
+            restaurant_name=cached_fields.get("restaurant_name") or "",
+            pickup_address=cached_fields.get("pickup_address") or "",
+            delivery_address=cached_fields.get("delivery_address") or cached_fields.get("dropoff_address") or "",
+            fee=float(cached_fields.get("fee") or cached_fields.get("delivery_fee") or 0),
+            currency=cached_fields.get("currency") or "GEL",
+            created_at=cached_fields.get("created_at"),
+            comment=cached_fields.get("comment") or "",
+            distance_km=cached_fields.get("distance_km"),
+            tips=float(cached_fields.get("tips") or 0),
+            pickup_lat=cached_fields.get("pickup_lat"),
+            pickup_lng=cached_fields.get("pickup_lng"),
+            dropoff_lat=cached_fields.get("dropoff_lat") or cached_fields.get("delivery_lat"),
+            dropoff_lng=cached_fields.get("dropoff_lng") or cached_fields.get("delivery_lng"),
+            lang=lang,
+            delivered=True,
+            accepted_at=accepted_at_val,
+        )
+
+        try:
+            await callback.message.edit_caption(
+                caption=new_caption,
+                reply_markup=done_kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e_edit:
+            log.warning("edit delivered caption failed order=%s: %s", order_id, e_edit)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=done_kb)
+            except Exception:
+                pass
+
+        # Отправляем курьеру подтверждение завершения и начисления
+        try:
+            total_fee = float(cached_fields.get("fee") or cached_fields.get("delivery_fee") or 0)
+            total_tips = float(cached_fields.get("tips") or 0)
+            total_payout = total_fee + total_tips
+            payout_str = _fmt_caption_lari(total_payout) if total_payout > 0 else ""
+            tips_str = _fmt_caption_lari(total_tips) if total_tips > 0 else ""
+
+            if lang == "ru":
+                tips_line = f'\n{ce(CUSTOM_EMOJI["income_today"], "🎁")} Включая чаевые: <b>{tips_str}</b>' if total_tips > 0 else ""
+                finish_text = (
+                    f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>Заказ #{order_id} успешно доставлен!</b>\n\n'
+                    f'{ce(CUSTOM_EMOJI["balance"], "💰")} Начислено на баланс: <b>{payout_str}</b>{tips_line}\n\n'
+                    f'{ce(CUSTOM_EMOJI["open_restaurant"], "🟢")} <b>Вы на линии</b> — ожидайте новые заказы.'
+                )
+            elif lang == "ka":
+                tips_line = f'\n{ce(CUSTOM_EMOJI["income_today"], "🎁")} მათ შორის ჩაი: <b>{tips_str}</b>' if total_tips > 0 else ""
+                finish_text = (
+                    f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>შეკვეთა #{order_id} წარმატებით დასრულდა!</b>\n\n'
+                    f'{ce(CUSTOM_EMOJI["balance"], "💰")} ბალანსზე დარიცხულია: <b>{payout_str}</b>{tips_line}\n\n'
+                    f'{ce(CUSTOM_EMOJI["open_restaurant"], "🟢")} <b>ხაზზე ხართ</b> — დაელოდეთ ახალ შეკვეთებს.'
+                )
+            else:
+                tips_line = f'\n{ce(CUSTOM_EMOJI["income_today"], "🎁")} Including tips: <b>{tips_str}</b>' if total_tips > 0 else ""
+                finish_text = (
+                    f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>Order #{order_id} successfully delivered!</b>\n\n'
+                    f'{ce(CUSTOM_EMOJI["balance"], "💰")} Credited to balance: <b>{payout_str}</b>{tips_line}\n\n'
+                    f'{ce(CUSTOM_EMOJI["open_restaurant"], "🟢")} <b>You are online</b> — waiting for new orders.'
+                )
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=finish_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.warning("finish order notification failed order=%s tg=%s: %s", order_id, telegram_id, e)
+
+        # Уведомляем ресторан и переводим карточку ресторана в статус завершённой
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(notify_restaurant_order_delivered(int(order_id)))
+        except Exception as e_rn:
+            log.warning("schedule notify_restaurant_order_delivered failed order=%s: %s", order_id, e_rn)
 
     await callback.answer(alert_text, show_alert=True)
 
     if action != "rejected":
         await db.update_kind(order_id, telegram_id, "tracking")
+
+
+async def notify_restaurant_order_delivered(order_id: int) -> None:
+    """Обновляет карточку заказа ресторана (первая строка → ЗАКАЗ #ID ЗАВЕРШЁН) и шлёт отчёт."""
+    # Загружаем данные заказа из order.db
+    order_data = {}
+    for p in ORDER_DB_PATHS:
+        if not os.path.exists(p):
+            continue
+        try:
+            conn = connect_sqlite_wal(p)
+            conn.row_factory = sqlite3.Row
+            r = conn.execute("SELECT * FROM orders WHERE id = ?", (int(order_id),)).fetchone()
+            conn.close()
+            if r:
+                order_data = dict(r)
+                break
+        except Exception as ex:
+            log.warning("notify_restaurant_delivered order.db err: %s", ex)
+
+    try:
+        msgs = await db.get_messages_for_order(int(order_id))
+    except Exception:
+        msgs = []
+
+    rest_msgs = [m for m in msgs if (m.get("role") or "") == "restaurant"]
+
+    # Резервный поиск карточки ресторана: order.db -> partners -> order_messages
+    if not rest_msgs and order_data.get("restaurant_id"):
+        try:
+            rest_id = str(order_data["restaurant_id"])
+            partner = await db.get_partner_by_restaurant_id(rest_id)
+            if partner and partner.get("telegram_id"):
+                r_tg = int(partner["telegram_id"])
+                om = await db.get_order_message(int(order_id), r_tg)
+                if om and om.get("message_id"):
+                    rest_msgs.append({
+                        "telegram_id": r_tg,
+                        "message_id": int(om["message_id"]),
+                        "role": "restaurant",
+                    })
+        except Exception as e_fb:
+            log.warning("notify_restaurant_delivered fallback err: %s", e_fb)
+
+    if not rest_msgs:
+        log.info("notify_restaurant_delivered: no restaurant messages for order %s", order_id)
+        return
+
+    import json
+    items = []
+    raw_items = order_data.get("items")
+    if raw_items:
+        try:
+            if isinstance(raw_items, str):
+                items = json.loads(raw_items)
+            elif isinstance(raw_items, list):
+                items = raw_items
+        except Exception:
+            items = []
+
+    total_val = float(order_data.get("total") or 0.0)
+    del_fee = float(order_data.get("delivery_fee") or 0.0)
+    serv_fee = float(order_data.get("service_fee") or 0.0)
+    tips_val = float(order_data.get("tips") or 0.0)
+    food_amount = max(0.0, total_val - del_fee - serv_fee - tips_val)
+    if not food_amount and items:
+        for it in items:
+            try:
+                food_amount += float(it.get("price") or 0) * int(it.get("quantity") or 1)
+            except Exception:
+                pass
+
+    rest_income = round(food_amount * RESTAURANT_ITEMS_SHARE, 2)
+    food_str = _fmt_caption_lari(food_amount)
+    income_str = _fmt_caption_lari(rest_income)
+
+    seen_tg = set()
+    for m in rest_msgs:
+        tg_id = int(m.get("telegram_id") or 0)
+        mid = int(m.get("message_id") or 0)
+        if tg_id <= 0 or tg_id in seen_tg:
+            continue
+        seen_tg.add(tg_id)
+
+        user = await db.get_bot_user(tg_id) or {}
+        lang = user.get("language", "ru")
+
+        details_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=t(lang, "btn_open_details"),
+                web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                icon_custom_emoji_id="5384138412053796842",
+            )
+        ]])
+
+        # 1. Обновление карточки заказа ресторана: меняется только первая строка на ЗАКАЗ #ID ЗАВЕРШЁН
+        order_row = _get_order_row(int(order_id)) or {}
+        card_data = dict(order_row)
+        card_data.update(order_data)
+        card_data["order_id"] = order_id
+        if items:
+            card_data["items"] = items
+        card_caption = format_order_message(
+            card_data,
+            lang=lang,
+            delivered=True,
+        )
+
+        try:
+            await bot.edit_message_caption(
+                chat_id=tg_id,
+                message_id=mid,
+                caption=card_caption,
+                reply_markup=details_kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e_cap:
+            log.warning("edit restaurant card caption failed order=%s tg=%s: %s", order_id, tg_id, e_cap)
+            try:
+                await bot.edit_message_text(
+                    chat_id=tg_id,
+                    message_id=mid,
+                    text=card_caption,
+                    reply_markup=details_kb,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                try:
+                    await bot.edit_message_reply_markup(chat_id=tg_id, message_id=mid, reply_markup=details_kb)
+                except Exception:
+                    pass
+
+        # 2. Отдельное сообщение ресторану о завершении заказа
+        if lang == "ka":
+            finish_msg = (
+                f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>შეკვეთა #{order_id} წარმატებით მიწოდებულია!</b>\n\n'
+                f'{ce(CUSTOM_EMOJI["balance"], "💰")} შეკვეთის თანხა: <b>{food_str}</b>\n'
+                f'{ce(CUSTOM_EMOJI["income_today"], "💵")} რესტორნის დარიცხვა: <b>{income_str}</b>\n\n'
+                f'თანხა ჩაირიცხა რესტორნის ბალანსზე.'
+            )
+        elif lang == "ru":
+            finish_msg = (
+                f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>Заказ #{order_id} успешно доставлен!</b>\n\n'
+                f'{ce(CUSTOM_EMOJI["balance"], "💰")} Сумма заказа: <b>{food_str}</b>\n'
+                f'{ce(CUSTOM_EMOJI["income_today"], "💵")} Начислено заведению: <b>{income_str}</b>\n\n'
+                f'Средства зачислены на баланс ресторана.'
+            )
+        else:
+            finish_msg = (
+                f'{ce(CUSTOM_EMOJI["success"], "✅")} <b>Order #{order_id} successfully delivered!</b>\n\n'
+                f'{ce(CUSTOM_EMOJI["balance"], "💰")} Order amount: <b>{food_str}</b>\n'
+                f'{ce(CUSTOM_EMOJI["income_today"], "💵")} Credited to restaurant: <b>{income_str}</b>\n\n'
+                f'Funds have been credited to the restaurant balance.'
+            )
+
+        try:
+            await bot.send_message(
+                chat_id=tg_id,
+                text=finish_msg,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e_send:
+            log.warning("send restaurant delivered message failed order=%s tg=%s: %s", order_id, tg_id, e_send)
 
 
 # ─────────────────────────────────────────────
@@ -6192,8 +8150,8 @@ async def update_courier_online_backend(telegram_id: int, action: str) -> bool:
 
 
 async def update_order_status_backend(order_id: int, status: str) -> bool:
-    """Отправляет PATCH /api/v1/bot/orders/{id}/status на бэкенд (bot token auth)."""
-    url = f"{BACKEND_URL}/api/v1/bot/orders/{order_id}/status"
+    """Отправляет PATCH /api/v1/orders/{id}/status на бэкенд (bot token auth)."""
+    url = f"{BACKEND_URL}/api/v1/orders/{order_id}/status"
     headers = {
         "Content-Type": "application/json",
         SECURITY_HEADER: SECURITY_TOKEN,
@@ -6219,11 +8177,12 @@ async def update_order_status_backend(order_id: int, status: str) -> bool:
 # ─────────────────────────────────────────────
 
 def check_token(request: web.Request) -> bool:
-    """Проверяет X-Bot-Security-Token в заголовке запроса."""
+    """Проверяет X-Bot-Security-Token в заголовке запроса с защитой от timing attack."""
     if not SECURITY_TOKEN:
         log.error("SECURITY_TOKEN not configured!")
         return False
-    return request.headers.get(SECURITY_HEADER) == SECURITY_TOKEN
+    header_token = request.headers.get(SECURITY_HEADER, "")
+    return hmac.compare_digest(header_token, SECURITY_TOKEN)
 
 
 async def handle_new_order(request: web.Request) -> web.Response:
@@ -6303,6 +8262,10 @@ async def handle_new_order(request: web.Request) -> web.Response:
     text = format_order_message(formatted_data, lang=rest_lang)
     keyboard = make_order_keyboard(order_id, lang=rest_lang)
 
+    if is_sunset_restaurant(restaurant_id or data.get("restaurant_id", "")):
+        _b, _f = calculate_sunset_packaging(items)
+        items_total += _f
+
     try:
         # Баннер 2a: items / ₾ total / таймер 5:00 (окно ресторана ~5 мин)
         msg = await send_banner_photo(
@@ -6323,6 +8286,7 @@ async def handle_new_order(request: web.Request) -> web.Response:
         )
         await db.save_order_message(order_id, telegram_id, msg.message_id)
         await db.save_message(order_id, telegram_id, msg.message_id, "restaurant", "new_order")
+        schedule_restaurant_accept_reminder(int(order_id), int(telegram_id), msg.message_id, delay_sec=150)
         return web.json_response({"ok": True, "message_id": msg.message_id})
     except Exception as e:
         log.error("new-order: telegram send failed: %s", e)
@@ -6369,17 +8333,17 @@ def _courier_payout_total(delivery_fee=0, tips=0) -> float:
 
 
 def _fmt_caption_lari(value) -> str:
-    """Сумма в HTML-подписи Telegram: «98.00 ₾» (число, потом символ)."""
+    """Сумма в HTML-подписи Telegram: «98.00 ₾» (число, потом неразрывный пробел и символ)."""
     try:
         n = float(value)
     except (TypeError, ValueError):
-        return f"{value} ₾"
+        return f"{value}\u00A0₾"
     if n == int(n):
         iv = int(n)
         if abs(iv) >= 1000:
-            return f"{iv:,} ₾"
-        return f"{iv} ₾"
-    return f"{n:.2f} ₾"
+            return f"{iv:,}\u00A0₾"
+        return f"{iv}\u00A0₾"
+    return f"{n:.2f}\u00A0₾"
 
 
 def _items_food_total(items) -> float:
@@ -6409,58 +8373,160 @@ def format_broadcast_text(
     dropoff_lat: float | None = None,
     dropoff_lng: float | None = None,
     lang: str = "ru",
+    delivered: bool = False,
+    accepted_at=None,
+    customer_name: str = "",
 ) -> str:
-    """HTML-карточка нового заказа для курьера (как у ресторана: premium-emoji + <b>)."""
+    """HTML-карточка заказа для курьера (фирменные tg-emoji + компактный маршрут без лишних отступов)."""
     created_hm, deadline_hm = _format_order_time(
         created_at, minutes=COURIER_ACCEPT_MIN
     )
     comment = _clean_order_comment(comment)
     currency = currency or "GEL"
 
-    pickup_addr = localize_address_for_courier(pickup_address, lang)
+    target_addr_lang = "ka" if (lang or "").startswith("ka") else "en"
+    pickup_addr_en = localize_address_for_courier(pickup_address, target_addr_lang)
+    pickup_addr_ka = localize_address_for_courier(pickup_address, "ka")
+
+    dropoff_addr_en = localize_address_for_courier(delivery_address, target_addr_lang)
+    dropoff_addr_ka = localize_address_for_courier(delivery_address, "ka")
+
     rest_name = (restaurant_name or "").strip()
-    if pickup_addr and rest_name and pickup_addr.lower() != rest_name.lower():
-        pickup_line = (
-            f"{html_maps_link(pickup_addr, address=pickup_addr)}"
-            f" | {html.escape(rest_name)}"
-        )
-    else:
-        label = pickup_addr or rest_name or "—"
-        pickup_line = html_maps_link(label, address=pickup_addr or rest_name)
-
-    dropoff_raw = localize_address_for_courier(delivery_address, lang) or "—"
-    dropoff_line = html_maps_link(dropoff_raw, address=dropoff_raw)
-
-    if distance_km is None or distance_km == "":
-        distance_str = t(lang, "courier_distance_km", n="1.5")
-    else:
+    if not rest_name or not pickup_address:
         try:
-            distance_str = t(lang, "courier_distance_km", n=f"{float(distance_km):.1f}")
-        except (TypeError, ValueError):
-            distance_str = str(distance_km)
-            low = distance_str.lower()
-            if "км" not in low and "km" not in low and "კმ" not in distance_str:
-                distance_str = t(lang, "courier_distance_km", n=distance_str)
+            pts = _fetch_order_map_points_sync(int(order_id))
+            if not rest_name:
+                rest_name = (pts.get("restaurant_name") or "").strip()
+            if not pickup_address:
+                pickup_address = (pts.get("pickup_address") or "").strip()
+        except Exception:
+            pass
+
+    accept_label = t(lang, "label_accept_by")
+    if lang == "ru":
+        addr_label = "Адрес:"
+        client_label = "Клиент"
+    elif lang == "ka":
+        addr_label = "მისამართი:"
+        client_label = "კლიენტი"
+    else:
+        addr_label = "Address:"
+        client_label = "Client"
+
+    # Ссылки на карты с точным поиском на грузинском / Mestia
+    pickup_link = html_maps_link(
+        pickup_addr_en or rest_name or "—",
+        lat=pickup_lat,
+        lng=pickup_lng,
+        search_query=pickup_addr_ka or pickup_address or rest_name,
+    )
+    dropoff_link = html_maps_link(
+        dropoff_addr_en or "—",
+        lat=dropoff_lat,
+        lng=dropoff_lng,
+        search_query=dropoff_addr_ka or delivery_address,
+    )
+
+    # 1. Заведение: первым название с фирменным эмодзи (пакет/ресторан), ниже адрес без эмодзи
+    restaurant_block = (
+        f'{ce("5384312315279612142", "🛍️")} <b>{html.escape(rest_name or "Ресторан")}</b>\n'
+        f'{addr_label} {pickup_link}'
+    )
+
+    # 2. Доставка: первым Клиент с фирменным эмодзи (метка), ниже адрес доставки без эмодзи
+    cust_name = (customer_name or "").strip()
+    if not cust_name and order_id:
+        try:
+            cust_name = _fetch_order_customer_name_sync(int(order_id))
+        except Exception:
+            pass
+
+    if cust_name:
+        client_title = f"{client_label} {cust_name}"
+    else:
+        client_title = client_label
+
+    client_block = (
+        f'{ce("5382351125838077755", "📍")} <b>{html.escape(client_title)}</b>\n'
+        f'{addr_label} {dropoff_link}'
+    )
 
     try:
         tips_val = float(tips or 0)
     except (TypeError, ValueError):
         tips_val = 0.0
 
-    parts = [
-        f'{ce("5384244502040975393", "🔔")} <b>{t(lang, "courier_new_order_title", order_id=order_id)}</b>',
-        f" <b>{t(lang, 'courier_created_accept_until', created=created_hm, deadline=deadline_hm)}</b>",
-        "",
-        f'{ce("5384312315279612142", "📍")} <b>{t(lang, "courier_pickup")}</b> {pickup_line}',
-        f'{ce("5384312315279612142", "📍")} <b>{t(lang, "courier_dropoff")}</b> {dropoff_line}',
-        f'{ce("5382351125838077755", "📏")} <b>{t(lang, "courier_distance")}</b> {html.escape(distance_str)}',
-        "",
-        f'{ce("5384520939021048827", "💰")} <b>{t(lang, "courier_income")}</b> {_fmt_caption_lari(fee)}',
-    ]
+    # Доход и чаевые в одной строке
+    total_payout = float(fee or 0) + tips_val
+    income_label = t(lang, "courier_income")
     if tips_val > 0:
-        parts.append(
-            f'{ce("5384518714227990146", "✨")} <b>{t(lang, "courier_tips")}</b> {_fmt_caption_lari(tips_val)}'
-        )
+        if lang == "ru":
+            income_val = f"{_fmt_caption_lari(total_payout)} ({_fmt_caption_lari(tips_val)} чаевые)"
+        elif lang == "ka":
+            income_val = f"{_fmt_caption_lari(total_payout)} ({_fmt_caption_lari(tips_val)} ჩაი)"
+        else:
+            income_val = f"{_fmt_caption_lari(total_payout)} ({_fmt_caption_lari(tips_val)} tips)"
+    else:
+        income_val = _fmt_caption_lari(total_payout)
+
+    # Дистанция маршрута с пометками дальности по Местии
+    dist_val = None
+    if distance_km not in (None, "", "—"):
+        try:
+            dist_val = float(str(distance_km).replace("km", "").replace("км", "").strip())
+        except (TypeError, ValueError):
+            pass
+    if dist_val is None and pickup_lat and pickup_lng and dropoff_lat and dropoff_lng:
+        try:
+            import math
+            R = 6371.0
+            dlat = math.radians(dropoff_lat - pickup_lat)
+            dlng = math.radians(dropoff_lng - pickup_lng)
+            a = math.sin(dlat / 2)**2 + math.cos(math.radians(pickup_lat)) * math.cos(math.radians(dropoff_lat)) * math.sin(dlng / 2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            dist_val = round(R * c * 1.25, 1)
+        except Exception:
+            pass
+
+    distance_line = ""
+    if dist_val and dist_val > 0:
+        if lang == "ru":
+            zone_note = " (центр)" if dist_val <= 0.8 else (" (дальний район)" if dist_val >= 2.5 else "")
+            distance_line = f'{ce("5382248944271140910", "🗺️")} <b>Расстояние:</b> ~{dist_val:.1f} км{zone_note}'
+        elif lang == "ka":
+            zone_note = " (ცენტრი)" if dist_val <= 0.8 else ""
+            distance_line = f'{ce("5382248944271140910", "🗺️")} <b>მანძილი:</b> ~{dist_val:.1f} კმ{zone_note}'
+        else:
+            zone_note = " (center)" if dist_val <= 0.8 else ""
+            distance_line = f'{ce("5382248944271140910", "🗺️")} <b>Distance:</b> ~{dist_val:.1f} km{zone_note}'
+
+    # Заголовок
+    if delivered:
+        if lang == "ka":
+            header_line = f'{ce("5384244502040975393", "✅")} <b>შეკვეთა #{order_id} დასრულებულია</b>'
+        elif lang == "ru":
+            header_line = f'{ce("5384244502040975393", "✅")} <b>ЗАКАЗ #{order_id} ЗАВЕРШЁН</b>'
+        else:
+            header_line = f'{ce("5384244502040975393", "✅")} <b>ORDER #{order_id} COMPLETED</b>'
+        parts = [header_line, ""]
+    else:
+        parts = [
+            f'{ce("5384244502040975393", "🟢")} <b>{t(lang, "courier_new_order_title", order_id=order_id)}</b>',
+            "",
+        ]
+
+    # Маршрут: ресторан с адресом, отступ, затем клиент с адресом и расстоянием
+    client_section = client_block
+    if distance_line:
+        client_section = f"{client_block}\n{distance_line}"
+
+    parts.append(restaurant_block)
+    parts.append("")
+    parts.append(client_section)
+    parts.append("")
+
+    # Доход и комментарий
+    parts.append(f'{ce("5384520939021048827", "💰")} <b>{income_label}</b> {income_val}')
     comment_text = html.escape(comment) if comment else t(lang, "comment_none")
     parts.append(
         f'{ce("5382097310450753507", "💬")} <b>{t(lang, "courier_comment")}</b> {comment_text}'
@@ -6530,12 +8596,9 @@ def format_courier_active_caption(
         dropoff_lat=cached.get("dropoff_lat"),
         dropoff_lng=cached.get("dropoff_lng"),
         lang=lang,
+        customer_name=cached.get("customer_name") or "",
     )
-    phase = t(lang, phase_key)
-    return (
-        f"{base}\n\n"
-        f'{ce("5382351125838077755", "📍")} <b>{html.escape(phase)}</b>'
-    )
+    return base
 
 
 async def edit_courier_tracking_caption(
@@ -6548,47 +8611,8 @@ async def edit_courier_tracking_caption(
     last_action: str = "",
     current_status: str = "",
 ) -> bool:
-    """Update courier card caption with the current phase (bot ↔ miniapp)."""
-    fields = await load_courier_broadcast_fields(int(order_id))
-    phase = courier_phase_key(
-        next_action=next_action,
-        last_action=last_action,
-        current_status=current_status,
-    )
-    caption = format_courier_active_caption(
-        order_id=order_id, fields=fields, lang=lang, phase_key=phase
-    )
-    if not caption:
-        return False
-    try:
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-        )
-        return True
-    except Exception as e:
-        err = str(e).lower()
-        if "not modified" in err or "message is not modified" in err:
-            return True
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-        except Exception as e2:
-            err2 = str(e2).lower()
-            if "not modified" in err2:
-                return True
-            log.warning(
-                "edit_courier_tracking_caption failed order=%s: %s / %s",
-                order_id, e, e2,
-            )
-            return False
+    """NO-OP: карточку заказа курьера не меняем (как у ресторана), меняются только статус-кнопки."""
+    return True
 
 
 def make_broadcast_keyboard(order_id: int, lang: str = "ru") -> InlineKeyboardMarkup:
@@ -6709,6 +8733,9 @@ def cancel_courier_snooze(
 
 async def remember_courier_broadcast_fields(order_id: int, fields: dict) -> None:
     payload = dict(fields or {})
+    if len(_COURIER_BROADCAST_FIELDS) > 300:
+        for k in list(_COURIER_BROADCAST_FIELDS.keys())[:-200]:
+            _COURIER_BROADCAST_FIELDS.pop(k, None)
     _COURIER_BROADCAST_FIELDS[int(order_id)] = payload
     if db is not None:
         await db.upsert_courier_broadcast_cache(int(order_id), payload)
@@ -6891,14 +8918,15 @@ async def _restore_courier_offer_after_snooze(
         tips_val = float(cached.get("tips") or 0)
     except (TypeError, ValueError):
         tips_val = 0.0
+    banner_lang = "ka" if lang.startswith("ka") else "en"
     fields = {
         "pickup_address": localize_address_for_courier(
-            cached.get("pickup_address") or "—", lang
+            cached.get("pickup_address") or "—", banner_lang
         ),
         "dropoff_address": localize_address_for_courier(
-            cached.get("dropoff_address") or "—", lang
+            cached.get("dropoff_address") or "—", banner_lang
         ),
-        "route_distance": route_distance,
+        "route_distance": "",
         "courier_payout": cached.get("missed_payout")
         or (_fmt_banner_lari(cached.get("fee") or 0) if cached else _fmt_banner_lari(0)),
     }
@@ -7013,12 +9041,134 @@ async def restore_pending_courier_snoozes() -> None:
     log.info("Restored %d courier snooze job(s) from DB", restored)
 
 
+_REST_ACCEPT_REMIND_TASKS: dict[int, asyncio.Task] = {}
+_REST_ACCEPT_REMIND_MSGS: dict[int, list[tuple[int, int]]] = {}
+
+
+def cancel_restaurant_accept_reminders(order_id: int) -> None:
+    """Отменяет таймер напоминания ресторану и удаляет отправленные сообщения-напоминания из чата."""
+    oid = int(order_id)
+    task = _REST_ACCEPT_REMIND_TASKS.pop(oid, None)
+    if task and not task.done():
+        task.cancel()
+    pings = _REST_ACCEPT_REMIND_MSGS.pop(oid, [])
+    if pings:
+        async def _del_pings():
+            for tid, mid in pings:
+                try:
+                    await bot.delete_message(chat_id=tid, message_id=mid)
+                except Exception:
+                    pass
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_del_pings())
+        except RuntimeError:
+            pass
+
+
+async def _fire_restaurant_accept_reminder(order_id: int, telegram_id: int, reply_to_mid: int) -> None:
+    oid = int(order_id)
+    _REST_ACCEPT_REMIND_TASKS.pop(oid, None)
+    st = get_order_current_status(oid)
+    if st and st != "pending":
+        return
+
+    user = await db.get_bot_user(int(telegram_id)) or {}
+    lang = user.get("language", "ru")
+    if lang == "ka":
+        text = (
+            f'{ce("5384244502040975393", "🟢")} <b>ყურადღება:</b> შეკვეთა <b>#{oid}</b> ელოდება დადასტურებას. მისაღებად გამოიყენეთ ზემოთ მოცემული ბარათი.'
+        )
+    elif lang == "ru":
+        text = (
+            f'{ce("5384244502040975393", "🟢")} <b>Внимание:</b> Заказ <b>#{oid}</b> ожидает подтверждения. Для принятия в работу используйте карточку заказа выше.'
+        )
+    else:
+        text = (
+            f'{ce("5384244502040975393", "🟢")} <b>Attention:</b> Order <b>#{oid}</b> is awaiting confirmation. Use the order card above to accept it.'
+        )
+
+    try:
+        sent_msg = await bot.send_message(
+            chat_id=int(telegram_id),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=int(reply_to_mid) if reply_to_mid else None,
+        )
+        if sent_msg and hasattr(sent_msg, "message_id"):
+            _REST_ACCEPT_REMIND_MSGS.setdefault(oid, []).append((int(telegram_id), sent_msg.message_id))
+            log.info("restaurant accept reminder sent order=%s tg=%s msg_id=%s", oid, telegram_id, sent_msg.message_id)
+    except Exception as e:
+        log.warning("restaurant reminder send failed order=%s tg=%s: %s", oid, telegram_id, e)
+
+
+def schedule_restaurant_accept_reminder(
+    order_id: int, telegram_id: int, message_id: int, delay_sec: int = 150
+) -> None:
+    """Планирует напоминание ресторану, если через delay_sec заказ всё ещё pending."""
+    cancel_restaurant_accept_reminders(order_id)
+    oid = int(order_id)
+    tid = int(telegram_id)
+    mid = int(message_id)
+
+    async def _job():
+        try:
+            await asyncio.sleep(delay_sec)
+            await _fire_restaurant_accept_reminder(oid, tid, mid)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("restaurant accept reminder job failed order=%s: %s", oid, e)
+
+    _REST_ACCEPT_REMIND_TASKS[oid] = asyncio.create_task(_job())
+    log.info("restaurant accept reminder scheduled order=%s in %ds", oid, delay_sec)
+
+
+_COURIER_ASSIGN_REMIND_MSGS: dict[int, list[tuple[int, int]]] = {}
+
+
 def cancel_courier_assign_reminders(order_id: int, *, persist: bool = True) -> None:
     oid = int(order_id)
     for stage in (COURIER_ASSIGN_REMIND_MIN, COURIER_ASSIGN_REMIND_MIN + COURIER_ASSIGN_REMIND2_MIN):
         task = _COURIER_ASSIGN_REMIND_TASKS.pop((oid, stage), None)
         if task and not task.done():
             task.cancel()
+    # Удаляем отправленные напоминания из чата курьера, чтобы они не висели под карточкой
+    pings = _COURIER_ASSIGN_REMIND_MSGS.pop(oid, [])
+    if pings:
+        for tid, mid in pings:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(bot.delete_message(chat_id=tid, message_id=mid))
+            except Exception:
+                pass
+    # Также удаляем сохранённые в БД напоминания и SLA-алерты
+    try:
+        loop = asyncio.get_running_loop()
+        async def _del_saved_reminders():
+            if db is not None:
+                try:
+                    for rm in await db.get_messages_for_order_kind(oid, "assign_reminder"):
+                        try:
+                            await bot.delete_message(chat_id=rm["telegram_id"], message_id=rm["message_id"])
+                        except Exception:
+                            pass
+                    for sm in await db.get_messages_for_order_kind(oid, "sla_alert"):
+                        try:
+                            await bot.delete_message(chat_id=sm["telegram_id"], message_id=sm["message_id"])
+                        except Exception:
+                            pass
+                    for mid_sla in await db.get_sla_alerts(oid):
+                        try:
+                            await bot.delete_message(chat_id=ADMIN_TG_ID, message_id=mid_sla)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        loop.create_task(_del_saved_reminders())
+    except Exception:
+        pass
+
     if persist and db is not None:
         try:
             loop = asyncio.get_running_loop()
@@ -7067,24 +9217,27 @@ async def _ping_online_couriers_unassigned(order_id: int, *, urgent: bool = Fals
         seen.add(tid)
         user = await db.get_bot_user(tid) or {}
         lang = user.get("language", "ru")
-        text = (
-            f'{ce(CUSTOM_EMOJI["logo"], "🟢")} '
-            f"{t(lang, key, order_id=order_id)}"
-        )
+        text = t(lang, key, order_id=order_id)
         try:
-            await bot.send_message(
+            sent_msg = await bot.send_message(
                 chat_id=tid,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=mid or None,
             )
+            if sent_msg and hasattr(sent_msg, "message_id"):
+                _COURIER_ASSIGN_REMIND_MSGS.setdefault(int(order_id), []).append((tid, sent_msg.message_id))
+                await db.save_message(int(order_id), tid, sent_msg.message_id, "courier", "assign_reminder")
             sent += 1
         except Exception as e:
             log.warning(
                 "assign-remind ping failed order=%s tg=%s: %s", order_id, tid, e
             )
             try:
-                await bot.send_message(chat_id=tid, text=text, parse_mode=ParseMode.HTML)
+                sent_msg = await bot.send_message(chat_id=tid, text=text, parse_mode=ParseMode.HTML)
+                if sent_msg and hasattr(sent_msg, "message_id"):
+                    _COURIER_ASSIGN_REMIND_MSGS.setdefault(int(order_id), []).append((tid, sent_msg.message_id))
+                    await db.save_message(int(order_id), tid, sent_msg.message_id, "courier", "assign_reminder")
                 sent += 1
             except Exception as e2:
                 log.warning(
@@ -7110,18 +9263,22 @@ async def _notify_admin_unassigned(order_id: int, *, stage: int) -> None:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=f"📦 Открыть #{order_id}",
+                        text=f"Открыть #{order_id}",
+                        icon_custom_emoji_id="5384138412053796842",
                         callback_data=f"admin_order_{order_id}",
                     )
                 ]
             ]
         )
-        await bot.send_message(
+        sent_msg = await bot.send_message(
             ADMIN_TG_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb
         )
-        await db.mark_sla_alert(int(order_id), alert_type)
+        mid = sent_msg.message_id if sent_msg and hasattr(sent_msg, "message_id") else 0
+        await db.mark_sla_alert(int(order_id), alert_type, message_id=mid)
+        if mid > 0:
+            await db.save_message(int(order_id), ADMIN_TG_ID, mid, "admin", "sla_alert")
         if stage == COURIER_ASSIGN_REMIND_MIN:
-            await db.mark_sla_alert(int(order_id), "assign")
+            await db.mark_sla_alert(int(order_id), "assign", message_id=mid)
     except Exception as e:
         log.warning("assign-remind admin notify failed order=%s: %s", order_id, e)
 
@@ -7230,6 +9387,7 @@ async def broadcast_order_to_couriers(
     distance_km=1.5,
     schedule_reminders: bool = True,
     skip_blocked: bool = True,
+    customer_name: str = "",
 ) -> dict:
     """Шлёт оффер курьерам. Возвращает {sent, failed, skipped_blocked}."""
     oid = int(order_id)
@@ -7239,6 +9397,12 @@ async def broadcast_order_to_couriers(
     except (TypeError, ValueError):
         if distance_km:
             distance_label = str(distance_km).replace("км", "km").replace("КМ", "km")
+
+    if not customer_name:
+        try:
+            customer_name = await asyncio.to_thread(_fetch_order_customer_name_sync, oid)
+        except Exception:
+            pass
 
     fee_num = float(delivery_fee or 0)
     tips_num = float(tips or 0)
@@ -7264,6 +9428,7 @@ async def broadcast_order_to_couriers(
             "missed_payout": _fmt_banner_lari(payout_total),
             "phone": phone or "",
             "restaurant_name": restaurant_name or "",
+            "customer_name": customer_name or "",
             "created_at": created_at,
             "comment": comment or "",
             "distance_km": distance_km,
@@ -7296,18 +9461,20 @@ async def broadcast_order_to_couriers(
                 distance_km=distance_km,
                 tips=float(tips or 0),
                 lang=lang,
+                customer_name=customer_name or "",
             )
+            banner_lang = "ka" if lang.startswith("ka") else "en"
             banner_pickup = localize_address_for_courier(
-                pickup_address or restaurant_name, lang
+                pickup_address or restaurant_name, banner_lang
             )
-            banner_dropoff = localize_address_for_courier(delivery_address, lang)
+            banner_dropoff = localize_address_for_courier(delivery_address, banner_lang)
             msg = await send_banner_photo(
                 chat_id=int(cid),
                 kind="order_new_courier",
                 fields={
                     "pickup_address": banner_pickup or restaurant_name,
                     "dropoff_address": banner_dropoff,
-                    "route_distance": distance_label,
+                    "route_distance": "",
                     "courier_payout": _fmt_banner_lari(payout_total),
                 },
                 keyboard=make_broadcast_keyboard(oid, lang=lang),
@@ -7363,12 +9530,238 @@ async def admin_rebroadcast_order(order_id: int) -> tuple[bool, str]:
     return True, f"Отправлено: {result['sent']}, ошибок: {len(result['failed'])}"
 
 
+async def admin_assign_courier(order_id: int, courier_tg: int) -> tuple[bool, str]:
+    """Принудительно назначает курьера на заказ через gateway и базу."""
+    oid = int(order_id)
+    tg = int(courier_tg)
+
+    # 1. Resolve courier backend_id
+    courier_backend_id = 0
+    for path in BACKEND_DB_PATHS:
+        if os.path.exists(path):
+            try:
+                conn = connect_sqlite_wal(path)
+                row = conn.execute(
+                    "SELECT id FROM admin_users WHERE telegram_id = ? AND role = 'courier'",
+                    (str(tg),),
+                ).fetchone()
+                conn.close()
+                if row:
+                    courier_backend_id = int(row[0])
+                    break
+            except Exception:
+                pass
+
+    # 2. Update order.db
+    for path in ORDER_DB_PATHS:
+        if os.path.exists(path):
+            try:
+                conn = connect_sqlite_wal(path)
+                conn.execute(
+                    "UPDATE orders SET courier_id = ?, courier_taken_at = datetime('now'), "
+                    "status = CASE WHEN lower(status) = 'pending' THEN 'accepted' ELSE status END WHERE id = ?",
+                    (courier_backend_id, oid),
+                )
+                conn.commit()
+                conn.close()
+                break
+            except Exception as e:
+                log.warning("admin_assign_courier update db failed: %s", e)
+
+    # 3. Notify gateway / backend
+    url = f"{BACKEND_URL}/api/v1/bot-callback"
+    headers = {
+        "Content-Type": "application/json",
+        SECURITY_HEADER: SECURITY_TOKEN,
+    }
+    payload = {
+        "order_id": oid,
+        "telegram_id": tg,
+        "action": "accepted",
+    }
+    try:
+        async with _aiohttp.ClientSession() as session:
+            await session.post(url, json=payload, headers=headers, timeout=_aiohttp.ClientTimeout(total=5))
+    except Exception as e:
+        log.warning("admin_assign_courier gateway notify failed: %s", e)
+
+    # 4. Send tracking card to courier
+    cached = await load_courier_broadcast_fields(oid)
+    phone = await resolve_courier_contact_phone(oid, cached.get("phone") or "")
+    user = await db.get_bot_user(tg) or {}
+    lang = user.get("language", "ru")
+
+    try:
+        all_msgs = await db.get_messages_for_order(oid)
+        courier_msg = next((m for m in all_msgs if m["telegram_id"] == tg), None)
+        if courier_msg:
+            await apply_courier_tracking_keyboard(
+                chat_id=tg,
+                message_id=int(courier_msg["message_id"]),
+                action="arrived_restaurant",
+                order_id=oid,
+                phone=phone,
+                lang=lang,
+            )
+        else:
+            text = (
+                f'{ce("5384138412053796842", "📦")} <b>Вам назначен заказ #{oid}!</b>\n\n'
+                f'{ce("5384312315279612142", "🍽")} <b>Ресторан:</b> {html.escape(cached.get("restaurant_name") or "—")}\n'
+                f'{ce("5382248944271140910", "📍")} <b>Куда:</b> {html.escape(cached.get("dropoff_address") or "—")}\n'
+                f'{ce("5384520939021048827", "💰")} <b>Оплата:</b> {_fmt_caption_lari(cached.get("fee") or 8.0)}'
+            )
+            kb = build_courier_tracking_keyboard(
+                action="arrived_restaurant",
+                order_id=oid,
+                phone=phone,
+                lang=lang,
+            )
+            sent_msg = await bot.send_message(tg, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await db.save_order_message(oid, tg, sent_msg.message_id)
+            await db.save_message(oid, tg, sent_msg.message_id, "courier", "winner")
+    except Exception as e:
+        log.warning("admin_assign_courier notify courier failed: %s", e)
+
+    cancel_courier_assign_reminders(oid)
+    return True, f"Курьер успешно назначен на заказ #{oid}!"
+
+
+async def cleanup_order_everywhere(order_id: int, *, delete_from_db: bool = True) -> tuple[bool, str]:
+    oid = int(order_id)
+    deleted_msgs = 0
+
+    # 1. Снимаем таймеры напоминаний в памяти
+    cancel_courier_assign_reminders(oid)
+    _REST_ACCEPT_REMIND_TASKS.pop(oid, None)
+
+    # 2. Удаляем все сообщения по заказу из bot_messages (рассылка курьерам, напоминания, победитель, алерты)
+    try:
+        b_msgs = await db.get_messages_for_order(oid)
+        for m in b_msgs:
+            tid = int(m.get("telegram_id") or 0)
+            mid = int(m.get("message_id") or 0)
+            if tid > 0 and mid > 0:
+                try:
+                    await bot.delete_message(chat_id=tid, message_id=mid)
+                    deleted_msgs += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning("cleanup_order bot_messages error: %s", e)
+
+    # 3. Удаляем сообщения ресторану из order_messages
+    try:
+        async with db._db.execute("SELECT telegram_id, message_id FROM order_messages WHERE order_id = ?", (oid,)) as cur:
+            o_rows = await cur.fetchall()
+            for r in o_rows:
+                tid = int(r["telegram_id"] or 0)
+                mid = int(r["message_id"] or 0)
+                if tid > 0 and mid > 0:
+                    try:
+                        await bot.delete_message(chat_id=tid, message_id=mid)
+                        deleted_msgs += 1
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.warning("cleanup_order order_messages error: %s", e)
+
+    # 4. Удаляем админские SLA-алерты
+    try:
+        for mid in await db.get_sla_alerts(oid):
+            if mid > 0:
+                try:
+                    await bot.delete_message(chat_id=ADMIN_TG_ID, message_id=mid)
+                    deleted_msgs += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning("cleanup_order sla_alerts error: %s", e)
+
+    # 5. Очищаем таблицы бота
+    try:
+        await db._db.execute("DELETE FROM courier_assign_reminders WHERE order_id = ?", (oid,))
+        await db._db.execute("DELETE FROM courier_broadcast_cache WHERE order_id = ?", (oid,))
+        await db._db.execute("DELETE FROM courier_snooze_jobs WHERE order_id = ?", (oid,))
+        await db._db.execute("DELETE FROM bot_messages WHERE order_id = ?", (oid,))
+        await db._db.execute("DELETE FROM order_messages WHERE order_id = ?", (oid,))
+        await db._db.execute("DELETE FROM admin_sla_alerts WHERE order_id = ?", (oid,))
+        await db._db.commit()
+    except Exception as e:
+        log.warning("cleanup_order bot DB error: %s", e)
+
+    await forget_courier_broadcast_fields(oid)
+
+    # 6. Удаляем или отменяем заказ в order.db
+    if delete_from_db:
+        for p in ORDER_DB_PATHS:
+            if os.path.exists(p):
+                try:
+                    conn = sqlite3.connect(p)
+                    conn.execute("DELETE FROM order_items WHERE order_id = ?", (oid,))
+                    conn.execute("DELETE FROM order_status_history WHERE order_id = ?", (oid,))
+                    conn.execute("DELETE FROM orders WHERE id = ?", (oid,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    log.warning("cleanup_order delete order.db error: %s", e)
+        return True, f"Заказ #{oid} полностью удалён. Сообщений удалено: {deleted_msgs}"
+    else:
+        await update_order_status_backend(oid, "cancelled")
+        return True, f"Заказ #{oid} отменён. Сообщений удалено: {deleted_msgs}"
+
+
+async def admin_delete_order(order_id: int) -> tuple[bool, str]:
+    return await cleanup_order_everywhere(int(order_id), delete_from_db=True)
+
+
 async def admin_cancel_order(order_id: int) -> tuple[bool, str]:
-    ok = await update_order_status_backend(int(order_id), "cancelled")
-    if ok:
-        cancel_courier_assign_reminders(int(order_id))
-        return True, f"Заказ #{order_id} отменён"
-    return False, "Не удалось отменить на сервере"
+    return await cleanup_order_everywhere(int(order_id), delete_from_db=False)
+
+
+async def admin_bulk_delete_orders(mode: str) -> tuple[bool, str]:
+    path = None
+    for p in ORDER_DB_PATHS:
+        if os.path.exists(p):
+            path = p
+            break
+    if not path:
+        return False, "База order.db не найдена"
+
+    try:
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        if mode == "test":
+            cur.execute(
+                "SELECT id FROM orders WHERE restaurant_id IN ('test_rest_01', 'demo') OR address LIKE '%тест%' OR comment LIKE '%тест%'"
+            )
+        elif mode == "1h":
+            cur.execute(
+                "SELECT id FROM orders WHERE created_at >= datetime('now', '-1 hour')"
+            )
+        elif mode == "cancelled":
+            cur.execute(
+                "SELECT id FROM orders WHERE status IN ('cancelled', 'canceled')"
+            )
+        else:
+            conn.close()
+            return False, f"Неизвестный режим: {mode}"
+
+        rows = cur.fetchall()
+        oids = [int(r[0]) for r in rows]
+        conn.close()
+    except Exception as e:
+        return False, f"Ошибка выборки: {e}"
+
+    if not oids:
+        return True, "Нет подходящих заказов для удаления"
+
+    deleted_count = 0
+    for oid in oids:
+        ok, msg = await cleanup_order_everywhere(oid, delete_from_db=True)
+        if ok:
+            deleted_count += 1
+
+    return True, f"Успешно удалено заказов: {deleted_count}. Все связанные сообщения стёрты."
 
 
 async def admin_ping_order_couriers(order_id: int) -> tuple[bool, str]:
@@ -7440,17 +9833,42 @@ async def admin_set_restaurant_open(restaurant_id: str, want_open: bool) -> tupl
     return False, "Каталог не обновлён"
 
 
-async def admin_send_partner_message(telegram_id: int, text: str) -> tuple[bool, str]:
+async def admin_send_partner_message(telegram_id: int, text: str, msg_type: str = "general") -> tuple[bool, str]:
     body = (text or "").strip()
     if not body:
         return False, "Пустое сообщение"
     try:
-        await bot.send_message(
-            int(telegram_id),
-            f'{ce(CUSTOM_EMOJI["btn_support"], "📩")} <b>Сообщение от платформы:</b>\n\n'
-            f"{html.escape(body)}",
-            parse_mode=ParseMode.HTML,
-        )
+        user = await db.get_bot_user(int(telegram_id)) or {}
+        lang = user.get("language", "ru")
+        icon_emoji = ce("5384244502040975393", "🟢")
+        if msg_type == "tech":
+            if lang == "ka":
+                header = f"{icon_emoji} <b>ტექნიკური შეტყობინება:</b>"
+            elif lang == "en":
+                header = f"{icon_emoji} <b>System Maintenance Notice:</b>"
+            else:
+                header = f"{icon_emoji} <b>Техническое уведомление:</b>"
+        else:
+            if lang == "ka":
+                header = f"{icon_emoji} <b>შეტყობინება პლატფორმისგან:</b>"
+            elif lang == "en":
+                header = f"{icon_emoji} <b>Platform Message:</b>"
+            else:
+                header = f"{icon_emoji} <b>Сообщение от платформы:</b>"
+
+        msg_text = f"{header}\n\n{body}"
+        try:
+            await bot.send_message(
+                int(telegram_id),
+                msg_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await bot.send_message(
+                int(telegram_id),
+                f"{header}\n\n{html.escape(body)}",
+                parse_mode=ParseMode.HTML,
+            )
         return True, "Отправлено"
     except Exception as e:
         return False, f"Не доставлено: {e}"
@@ -7475,6 +9893,11 @@ async def handle_broadcast(request: web.Request) -> web.Response:
         return web.Response(status=400, text="missing order_id or couriers")
 
     restaurant_name = req.get("restaurant_name", "")
+    rest_id = str(req.get("restaurant_id") or "").lower()
+    r_name_lower = str(restaurant_name or "").lower()
+    if "test_rest" in rest_id or "тест" in r_name_lower or "test" in r_name_lower:
+        log.info("broadcast: suppressed test order #%s (%s / %s) to couriers", order_id, rest_id, restaurant_name)
+        return web.json_response({"ok": True, "skipped": True, "reason": "test_order_suppressed"})
     pickup_address = req.get("pickup_address", "")
     delivery_address = req.get("delivery_address", "")
     phone = (req.get("phone") or req.get("customer_phone") or "").strip()
@@ -7517,6 +9940,12 @@ async def handle_broadcast(request: web.Request) -> web.Response:
     created_at = req.get("created_at")
     comment = req.get("comment") or req.get("courier_comment") or ""
     distance_km = req.get("distance_km", req.get("route_distance", 1.5))
+    customer_name = (req.get("customer_name") or req.get("customer") or "").strip()
+    if not customer_name:
+        try:
+            customer_name = await asyncio.to_thread(_fetch_order_customer_name_sync, int(order_id))
+        except Exception:
+            pass
 
     result = await broadcast_order_to_couriers(
         int(order_id),
@@ -7533,6 +9962,7 @@ async def handle_broadcast(request: web.Request) -> web.Response:
         distance_km=distance_km,
         schedule_reminders=True,
         skip_blocked=True,
+        customer_name=customer_name,
     )
     sent = result["sent"]
     failed = result["failed"]
@@ -7542,6 +9972,81 @@ async def handle_broadcast(request: web.Request) -> web.Response:
         order_id, sent, len(failed), len(result.get("skipped_blocked") or []),
     )
     return web.json_response({"ok": True, "sent": sent, "failed": failed})
+
+
+def _resolve_courier_details_sync(winner_tg: int, winner_user: dict | None = None) -> tuple[str, str]:
+    """
+    Возвращает (имя, телефон) курьера для уведомления заведения.
+    Ищет по цепочке: bot_users -> auth.db admin_users -> tg chat info.
+    Ни при каких обстоятельствах не подтягивает телефон клиента!
+    """
+    c_name = ""
+    c_phone = ""
+    tg_int = int(winner_tg)
+
+    # 1) bot_users в partners_bot.db
+    pdb = DB_PATH if "DB_PATH" in globals() else "partners_bot.db"
+    if os.path.exists(pdb):
+        try:
+            conn = connect_sqlite_wal(pdb)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT name, phone, backend_username FROM bot_users WHERE telegram_id = ?",
+                (tg_int,),
+            ).fetchone()
+            conn.close()
+            if row:
+                keys = row.keys()
+                if "phone" in keys and row["phone"]:
+                    c_phone = str(row["phone"]).strip()
+                if "name" in keys and row["name"]:
+                    c_name = str(row["name"]).strip()
+                if not c_name and row["backend_username"]:
+                    c_name = str(row["backend_username"]).strip()
+        except Exception as e:
+            log.warning("resolve courier bot_users failed: %s", e)
+
+    # 2) auth.db admin_users
+    for path in BACKEND_DB_PATHS if "BACKEND_DB_PATHS" in globals() else []:
+        if not os.path.exists(path):
+            continue
+        try:
+            conn = connect_sqlite_wal(path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT full_name, phone, username FROM admin_users WHERE telegram_id = ? AND role = 'courier'",
+                (str(tg_int),),
+            ).fetchone()
+            conn.close()
+            if row:
+                keys = row.keys()
+                if not c_phone and "phone" in keys and row["phone"]:
+                    c_phone = str(row["phone"]).strip()
+                if not c_name and "full_name" in keys and row["full_name"]:
+                    c_name = str(row["full_name"]).strip()
+                if not c_name and row["username"]:
+                    c_name = str(row["username"]).strip()
+                break
+        except Exception as e:
+            log.warning("resolve courier auth.db failed: %s", e)
+
+    # 3) winner_user из кэша aiogram
+    if winner_user:
+        if not c_name:
+            c_name = (
+                winner_user.get("name")
+                or winner_user.get("full_name")
+                or winner_user.get("first_name")
+                or winner_user.get("backend_username")
+                or ""
+            ).strip()
+        if not c_phone and winner_user.get("phone"):
+            c_phone = str(winner_user["phone"]).strip()
+
+    if not c_name:
+        c_name = f"Курьер (ID: {tg_int})"
+
+    return c_name, c_phone
 
 
 async def handle_assign(request: web.Request) -> web.Response:
@@ -7580,16 +10085,14 @@ async def handle_assign(request: web.Request) -> web.Response:
     # accept-callback уже ставит кнопку; assign часто приходит после смены kind.
     try:
         all_msgs = await db.get_messages_for_order(order_id)
-        winner_card = next(
-            (
-                m for m in all_msgs
-                if m["telegram_id"] == winner_tg
-                and m.get("kind") in ("broadcast", "tracking", "winner")
-            ),
-            None,
-        )
-        if winner_card:
-            mid = winner_card["message_id"]
+        winner_cards = [
+            m for m in all_msgs
+            if m["telegram_id"] == winner_tg
+            and m.get("kind") in ("broadcast", "tracking", "winner")
+        ]
+        if winner_cards:
+            primary_card = winner_cards[0]
+            mid = primary_card["message_id"]
             applied = await apply_courier_tracking_keyboard(
                 chat_id=int(winner_tg),
                 message_id=int(mid),
@@ -7603,21 +10106,99 @@ async def handle_assign(request: web.Request) -> web.Response:
                     "assign: winner keyboard with contact not applied order=%s tg=%s",
                     order_id, winner_tg,
                 )
-            await edit_courier_tracking_caption(
-                chat_id=int(winner_tg),
-                message_id=int(mid),
-                order_id=int(order_id),
-                lang=winner_lang,
-                next_action="arrived_restaurant",
-                last_action="accepted",
-            )
             winner_message_id = mid
             await db.update_kind(order_id, winner_tg, "tracking")
+            cancel_courier_assign_reminders(int(order_id))
+
+            # Убираем кнопки действий со всех вторичных/дублирующих карточек у курьера
+            extra_details_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=t(winner_lang, "btn_open_details"),
+                    web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                    icon_custom_emoji_id="5384138412053796842",
+                )
+            ]])
+            for extra_card in winner_cards[1:]:
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=int(winner_tg),
+                        message_id=int(extra_card["message_id"]),
+                        reply_markup=extra_details_kb,
+                    )
+                except Exception:
+                    pass
         else:
             log.warning(
                 "assign: no card for winner tg=%s order=%s — skip duplicate text",
                 winner_tg, order_id,
             )
+
+        # 1.1) Уведомление ресторану о назначенном курьере (сообщение с именем и телефоном)
+        try:
+            courier_name, courier_phone = _resolve_courier_details_sync(int(winner_tg), winner_user)
+            if req.get("courier_name"):
+                courier_name = str(req["courier_name"]).strip()
+            if not courier_name or courier_name.lower().startswith("курьер"):
+                try:
+                    tg_chat = await bot.get_chat(int(winner_tg))
+                    courier_name = tg_chat.full_name or tg_chat.first_name or tg_chat.username or courier_name
+                except Exception:
+                    pass
+
+            rest_cards = [m for m in all_msgs if (m.get("role") or "") == "restaurant"]
+            rest_tg = rest_cards[0]["telegram_id"] if rest_cards else None
+            if not rest_tg:
+                order_row = _get_order_row(int(order_id))
+                rest_id = order_row.get("restaurant_id")
+                if rest_id:
+                    p = await db.get_partner_by_restaurant(rest_id)
+                    if p:
+                        rest_tg = p.get("telegram_id")
+
+            already_notified = any(m.get("kind") == "courier_assigned_notify" for m in all_msgs)
+            if rest_tg and not already_notified:
+                rest_user = await db.get_bot_user(int(rest_tg)) or {}
+                rlang = rest_user.get("language", "ru")
+
+                clean_digits = re.sub(r'\D', '', courier_phone or "")
+                if clean_digits and len(clean_digits) >= 6:
+                    tel_prefix = "+" if not courier_phone.startswith("+") and len(clean_digits) >= 10 else ("+" if courier_phone.startswith("+") else "")
+                    phone_display = f'<a href="tel:{tel_prefix}{clean_digits}">{html.escape(courier_phone)}</a>'
+                elif courier_phone and courier_phone not in ("—", "-"):
+                    phone_display = html.escape(courier_phone)
+                else:
+                    phone_display = "неизвестен" if rlang == "ru" else ("უცნობია" if rlang == "ka" else "unknown")
+
+                if rlang == "ka":
+                    notify_text = (
+                        f'{ce("5384244502040975393", "🟢")} <b>კურიერი დაინიშნა შეკვეთაზე <b>#{order_id}</b>!</b>\n\n'
+                        f'{ce("5381848533060067195", "👤")} სახელი: <b>{html.escape(courier_name)}</b>\n'
+                        f'📞 ტელეფონი: <b>{phone_display}</b>'
+                    )
+                elif rlang == "ru":
+                    notify_text = (
+                        f'{ce("5384244502040975393", "🟢")} <b>Курьер назначен на заказ <b>#{order_id}</b>!</b>\n\n'
+                        f'{ce("5381848533060067195", "👤")} Имя: <b>{html.escape(courier_name)}</b>\n'
+                        f'📞 Телефон: <b>{phone_display}</b>'
+                    )
+                else:
+                    notify_text = (
+                        f'{ce("5384244502040975393", "🟢")} <b>Courier assigned to order <b>#{order_id}</b>!</b>\n\n'
+                        f'{ce("5381848533060067195", "👤")} Name: <b>{html.escape(courier_name)}</b>\n'
+                        f'📞 Phone: <b>{phone_display}</b>'
+                    )
+                rest_mid = rest_cards[0]["message_id"] if rest_cards else None
+                sent_notify = await bot.send_message(
+                    chat_id=int(rest_tg),
+                    text=notify_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=rest_mid or None,
+                )
+                await db.save_message(order_id, rest_tg, sent_notify.message_id, "restaurant", "courier_assigned_notify")
+                log.info("Notified restaurant %s about courier assign order=%s", rest_tg, order_id)
+        except Exception as e_rest_notif:
+            log.warning("Notify restaurant of courier assign failed order=%s: %s", order_id, e_rest_notif)
+
     except Exception as e:
         log.error("assign: winner UI failed: %s", e)
         return web.Response(status=502, text="telegram send failed")
@@ -7756,16 +10337,38 @@ async def handle_sync_state(request: web.Request) -> web.Response:
                 "sync-state: keyboard not applied order=%s tg=%s action=%s",
                 order_id, user_tg, next_action,
             )
-    else:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=user_tg,
-                message_id=target["message_id"],
-                reply_markup=None,
-            )
-        except Exception as e:
-            log.error("sync-state: clear markup failed: %s", e)
-            return web.Response(status=502, text="telegram edit failed")
+    curr_st = str(req.get("current_status") or "").lower()
+    if not next_action:
+        if curr_st in ("delivered", "completed"):
+            done_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=t(sync_lang, "btn_open_details"),
+                    web_app=WebAppInfo(url=miniapp_page_url(order_id=order_id)),
+                    icon_custom_emoji_id="5384138412053796842",
+                )
+            ]])
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=user_tg,
+                    message_id=target["message_id"],
+                    reply_markup=done_kb,
+                )
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(notify_restaurant_order_delivered(int(order_id)))
+            except Exception as e_rn:
+                log.warning("sync-state notify_restaurant_delivered failed: %s", e_rn)
+        else:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=user_tg,
+                    message_id=target["message_id"],
+                    reply_markup=None,
+                )
+            except Exception as e:
+                log.error("sync-state: clear markup failed: %s", e)
+                return web.Response(status=502, text="telegram edit failed")
 
     await edit_courier_tracking_caption(
         chat_id=int(user_tg),
@@ -8009,31 +10612,26 @@ async def handle_courier_arrived(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": False, "error": "restaurant telegram not found"}, status=404)
 
+    order_status = get_order_current_status(int(order_id))
+    # If order is already picked up, delivering, delivered, or cancelled, do not notify restaurant!
+    if order_status in ("delivering", "delivered", "completed", "cancelled"):
+        log.info("courier-arrived: skipped notification because order #%s status is %s", order_id, order_status)
+        return web.json_response({"ok": True, "skipped": True, "status": order_status})
+
     rest_user = await db.get_bot_user(int(restaurant_telegram_id)) or {}
     lang = rest_user.get("language", "ru")
     name = (courier_name or "").strip() or t(lang, "default_courier_name")
 
     log.info(
-        "Courier arrived: order_id=%s, restaurant_tg=%d, courier=%s",
+        "Courier arrived: order_id=%s, restaurant_tg=%d, courier=%s, status=%s (restaurant message suppressed)",
         order_id,
         restaurant_telegram_id,
         name,
+        order_status,
     )
 
-    text = (
-        f'{ce("5384312315279612142", "📍")} <b>{t(lang, "courier_arrived_title")}</b>\n'
-        f"{t(lang, 'courier_arrived_body', name=html.escape(str(name)), order_id=order_id)}"
-    )
-    try:
-        await bot.send_message(
-            chat_id=restaurant_telegram_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        log.warning("courier-arrived: failed to send telegram notification: %s", e)
-
-    return web.json_response({"ok": True, "restaurant_telegram_id": restaurant_telegram_id})
+    # Уведомление ресторану «Курьер на месте» отключено по запросу пользователя для исключения спама в чате
+    return web.json_response({"ok": True, "skipped": True, "reason": "suppressed_by_user_request"})
 
 
 async def handle_order_review(request: web.Request) -> web.Response:
@@ -8086,7 +10684,7 @@ async def handle_order_review(request: web.Request) -> web.Response:
         if restaurant_telegram_id > 0:
             stars_str = "⭐" * rest_rating
             lines = [
-                f"⭐️ <b>Новый отзыв по заказу #{order_id}</b>\n",
+                f'{ce("5384244502040975393", "⭐️")} <b>Новый отзыв по заказу <b>#{order_id}</b></b>\n',
                 f"<b>Оценка кухни:</b> {stars_str} ({rest_rating}/5)",
             ]
             if rest_tags:
@@ -8122,7 +10720,7 @@ async def handle_order_review(request: web.Request) -> web.Response:
         if courier_telegram_id > 0:
             c_stars = "⭐" * courier_rating
             lines = [
-                f"🛵 <b>Отзыв о доставке заказа #{order_id}</b>\n",
+                f'{ce("5384520939021048827", "🛵")} <b>Отзыв о доставке заказа <b>#{order_id}</b></b>\n',
                 f"<b>Оценка доставки:</b> {c_stars} ({courier_rating}/5)",
             ]
             if courier_tags:
@@ -8132,7 +10730,7 @@ async def handle_order_review(request: web.Request) -> web.Response:
 
             tips_amount = float(data.get("tips") or 0)
             if tips_amount > 0:
-                lines.append(f"\n💸 <b>Чаевые:</b> {tips_amount:.2f} ₾")
+                lines.append(f'\n{ce("5384518714227990146", "💸")} <b>Чаевые:</b> {tips_amount:.2f} ₾')
 
             text = "\n".join(lines)
             try:
@@ -8178,7 +10776,7 @@ async def handle_order_tips(request: web.Request) -> web.Response:
 
     if courier_telegram_id > 0:
         text = (
-            f"💸 <b>Вам начислены чаевые по заказу #{order_id}!</b>\n\n"
+            f'{ce("5384518714227990146", "💸")} <b>Вам начислены чаевые по заказу <b>#{order_id}</b>!</b>\n\n'
             f"<b>Сумма:</b> {tips_amount:.2f} ₾\n"
             f"Клиент поблагодарил вас за отличную доставку!"
         )
@@ -8195,9 +10793,964 @@ async def handle_order_tips(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "order_id": order_id, "tips": tips_amount})
 
 
+async def sync_all_bot_users_to_backend():
+    """Синхронизирует всех пользователей бота с admin_users в auth.db, удаляет фантомных курьеров."""
+    def _sync():
+        bot_users = []
+        try:
+            conn_p = connect_sqlite_wal(DB_PATH)
+            cur_p = conn_p.cursor()
+            cur_p.execute("SELECT telegram_id, language, role, backend_username FROM bot_users")
+            bot_users = cur_p.fetchall()
+            cur_p.execute("SELECT restaurant_id, telegram_id, restaurant_name FROM partners")
+            partners = cur_p.fetchall()
+            conn_p.close()
+        except Exception as e:
+            log.error("sync_all_bot_users_to_backend read bot db failed: %s", e)
+            return
+
+        partners_by_tg = {int(p[1]): {"restaurant_id": p[0], "restaurant_name": p[2]} for p in partners if p[1]}
+
+        for path in BACKEND_DB_PATHS:
+            if not os.path.exists(path):
+                continue
+            try:
+                conn_a = connect_sqlite_wal(path)
+                cur_a = conn_a.cursor()
+                for u in bot_users:
+                    tg_id = int(u[0])
+                    tg_str = str(tg_id)
+                    role = u[2]
+                    username = u[3]
+                    # Удаляем созданных шлюзом фантомных курьеров courier_<tg_id>
+                    cur_a.execute(
+                        "DELETE FROM admin_users WHERE username = ? OR (username LIKE 'courier_%' AND telegram_id = ?)",
+                        (f"courier_{tg_str}", tg_str),
+                    )
+                    if username:
+                        cur_a.execute(
+                            "UPDATE admin_users SET telegram_id = ? WHERE username = ?",
+                            (tg_str, username),
+                        )
+                        if role == "restaurant_admin" and tg_id in partners_by_tg:
+                            rid = partners_by_tg[tg_id]["restaurant_id"]
+                            cur_a.execute(
+                                "UPDATE admin_users SET restaurant_id = ? WHERE username = ?",
+                                (rid, username),
+                            )
+                for rid, tg_id, rname in partners:
+                    if tg_id:
+                        cur_a.execute(
+                            "UPDATE admin_users SET telegram_id = ? WHERE restaurant_id = ?",
+                            (str(tg_id), rid),
+                        )
+                conn_a.commit()
+                conn_a.close()
+                log.info("sync_all_bot_users_to_backend successfully synced users to %s", path)
+            except Exception as e:
+                log.error("sync_all_bot_users_to_backend failed for %s: %s", path, e)
+
+        # Предварительная синхронизация заказов из order.db в synced_orders
+        for opath in ORDER_DB_PATHS:
+            if not os.path.exists(opath):
+                continue
+            try:
+                conn_o = connect_sqlite_wal(opath)
+                cur_o = conn_o.cursor()
+                cur_o.execute("""
+                    SELECT id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items, created_at
+                    FROM orders ORDER BY id DESC LIMIT 500
+                """)
+                orders = cur_o.fetchall()
+                conn_o.close()
+
+                conn_p = connect_sqlite_wal(DB_PATH)
+                cur_p = conn_p.cursor()
+                for o in orders:
+                    oid, rid, cid, st, tot, fee, cname, phone, addr, comm, items, c_at = o
+                    cur_p.execute(
+                        """INSERT INTO synced_orders (id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items_json, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), datetime('now'))
+                           ON CONFLICT(id) DO UPDATE SET
+                             restaurant_id = CASE WHEN excluded.restaurant_id != '' THEN excluded.restaurant_id ELSE synced_orders.restaurant_id END,
+                             courier_id = CASE WHEN excluded.courier_id > 0 THEN excluded.courier_id ELSE synced_orders.courier_id END,
+                             status = excluded.status,
+                             total = CASE WHEN excluded.total > 0 THEN excluded.total ELSE synced_orders.total END,
+                             delivery_fee = CASE WHEN excluded.delivery_fee > 0 THEN excluded.delivery_fee ELSE synced_orders.delivery_fee END,
+                             customer_name = CASE WHEN excluded.customer_name != '' THEN excluded.customer_name ELSE synced_orders.customer_name END,
+                             phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE synced_orders.phone END,
+                             address = CASE WHEN excluded.address != '' THEN excluded.address ELSE synced_orders.address END,
+                             comment = CASE WHEN excluded.comment != '' THEN excluded.comment ELSE synced_orders.comment END,
+                             items_json = CASE WHEN excluded.items_json != '[]' THEN excluded.items_json ELSE synced_orders.items_json END,
+                             updated_at = datetime('now')""",
+                        (oid, rid or '', cid or 0, st or 'new', tot or 0.0, fee or 0.0, cname or '', phone or '', addr or '', comm or '', items or '[]', c_at or ''),
+                    )
+                conn_p.commit()
+                conn_p.close()
+                log.info("sync_all_bot_users_to_backend pre-synced %d orders from %s", len(orders), opath)
+            except Exception as e:
+                log.error("sync_all_bot_users_to_backend orders pre-sync failed for %s: %s", opath, e)
+
+    await asyncio.to_thread(_sync)
+
+
+async def handle_auth_session(request: web.Request) -> web.Response:
+    """Аутентификация пользователя Telegram для Mini App."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    tg_id_raw = data.get("telegram_id") or request.query.get("telegram_id")
+    if not tg_id_raw:
+        return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+
+    try:
+        telegram_id = int(tg_id_raw)
+    except (ValueError, TypeError):
+        return web.json_response({"ok": False, "error": "invalid telegram_id"}, status=400)
+
+    user = await db.get_bot_user(telegram_id)
+    partner = await db.get_partner_by_telegram(telegram_id)
+
+    # Если в bot_users не найден, проверим в auth.db по telegram_id
+    if not user:
+        for path in BACKEND_DB_PATHS:
+            if not os.path.exists(path):
+                continue
+            try:
+                conn = connect_sqlite_wal(path)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, username, role, restaurant_id FROM admin_users WHERE telegram_id = ? AND username NOT LIKE 'courier_%'",
+                    (str(telegram_id),),
+                )
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    u_role = row[2]
+                    u_name = row[1]
+                    await db.save_bot_user(telegram_id, "ru", u_role, u_name)
+                    if u_role == "restaurant_admin" and row[3]:
+                        await db.register_partner(telegram_id, row[3], u_name)
+                    user = await db.get_bot_user(telegram_id)
+                    partner = await db.get_partner_by_telegram(telegram_id)
+                    break
+            except Exception as e:
+                log.error("handle_auth_session auth check failed: %s", e)
+
+    if not user:
+        # Пользователь не зарегистрирован в боте
+        return web.json_response({
+            "ok": False,
+            "registered": False,
+            "error": "not_registered",
+            "bot_username": "MestiDelivery_Partners_Bot",
+            "message": "Пользователь не зарегистрирован в Telegram-боте партнёров",
+        }, status=200)
+
+    role = user.get("role") or ""
+    username = user.get("backend_username") or ""
+    language = user.get("language") or "ru"
+    restaurant_id = ""
+    restaurant_name = ""
+
+    if role == "restaurant_admin":
+        if partner:
+            restaurant_id = partner.get("restaurant_id") or ""
+            restaurant_name = partner.get("restaurant_name") or ""
+        if not restaurant_id:
+            # Попробуем найти в auth.db
+            for path in BACKEND_DB_PATHS:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    conn = connect_sqlite_wal(path)
+                    cur = conn.cursor()
+                    cur.execute("SELECT restaurant_id FROM admin_users WHERE username = ?", (username,))
+                    r = cur.fetchone()
+                    conn.close()
+                    if r and r[0]:
+                        restaurant_id = r[0]
+                        restaurant_name = r[0]
+                        await db.register_partner(telegram_id, restaurant_id, restaurant_name)
+                        break
+                except Exception:
+                    pass
+
+    # Находим user_id из admin_users
+    admin_user_id = None
+    for path in BACKEND_DB_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            conn = connect_sqlite_wal(path)
+            cur = conn.cursor()
+            # Удаляем созданных шлюзом фантомов для этого TG
+            cur.execute(
+                "DELETE FROM admin_users WHERE username = ? OR (username LIKE 'courier_%' AND telegram_id = ?)",
+                (f"courier_{telegram_id}", str(telegram_id)),
+            )
+            # Привязываем telegram_id к настоящему пользователю
+            if username:
+                cur.execute("UPDATE admin_users SET telegram_id = ? WHERE username = ?", (str(telegram_id), username))
+                cur.execute("SELECT id FROM admin_users WHERE username = ?", (username,))
+                r = cur.fetchone()
+                if r:
+                    admin_user_id = r[0]
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error("handle_auth_session clean phantom failed: %s", e)
+
+    if not admin_user_id:
+        admin_user_id = telegram_id % 10000000
+
+    now = int(time.time())
+    jwt_claims = {
+        "user_id": int(admin_user_id),
+        "username": username or f"user_{telegram_id}",
+        "role": role,
+        "restaurant_id": restaurant_id,
+        "typ": "access",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 86400 * 30,  # 30 дней
+    }
+    token = make_hs256_jwt(jwt_claims)
+
+    photo_url = (data.get("photo_url") or "").strip()
+    if photo_url:
+        COURIER_AVATAR_CACHE[telegram_id] = photo_url
+        if admin_user_id:
+            COURIER_AVATAR_CACHE[admin_user_id] = photo_url
+        if username:
+            COURIER_AVATAR_CACHE[username] = photo_url
+
+    log.info("Auth session generated for TG=%d, role=%s, user=%s, rest=%s, photo=%s", telegram_id, role, username, restaurant_id, bool(photo_url))
+
+    return web.json_response({
+        "ok": True,
+        "registered": True,
+        "token": token,
+        "user": {
+            "id": telegram_id,
+            "admin_user_id": admin_user_id,
+            "username": username,
+            "role": role,
+            "restaurant_id": restaurant_id,
+            "restaurant_name": restaurant_name,
+            "language": language,
+            "photo_url": photo_url or COURIER_AVATAR_CACHE.get(telegram_id) or COURIER_AVATAR_CACHE.get(admin_user_id) or "",
+            "is_online": bool(user.get("is_online", 0)),
+        },
+    })
+
+
+async def handle_gateway_webhook(request: web.Request) -> web.Response:
+    """Прием входящих вебхуков от бэкенда (order.created, order.status_changed)."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        log.warning("handle_gateway_webhook invalid json: %s", e)
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    event = payload.get("event") or request.headers.get("X-Event-Type") or ""
+    order_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+    order_id = order_data.get("order_id") or order_data.get("id")
+    if not order_id:
+        order_id = payload.get("order_id") or payload.get("id")
+
+    log.info("Gateway webhook received: event=%s, order_id=%s", event, order_id)
+
+    if not order_id:
+        return web.json_response({"ok": True, "note": "ignored, no order_id"})
+
+    try:
+        oid = int(order_id)
+    except (ValueError, TypeError):
+        return web.json_response({"ok": False, "error": "invalid order_id"}, status=400)
+
+    if event == "order.status_changed":
+        new_status = str(order_data.get("status") or payload.get("status") or "").lower()
+        if new_status:
+            cid = int(order_data.get("courier_id") or payload.get("courier_id") or 0)
+            await db.update_synced_order_status(oid, new_status, courier_id=cid)
+            log.info("Webhook updated status: order #%d -> %s (courier: %d)", oid, new_status, cid)
+    else:
+        to_save = {
+            "id": oid,
+            "restaurant_id": str(order_data.get("restaurant_id") or payload.get("restaurant_id") or ""),
+            "courier_id": int(order_data.get("courier_id") or payload.get("courier_id") or 0),
+            "status": str(order_data.get("status") or payload.get("status") or "new"),
+            "total": float(order_data.get("total") or payload.get("total") or 0.0),
+            "delivery_fee": float(order_data.get("delivery_fee") or payload.get("delivery_fee") or 0.0),
+            "customer_name": str(order_data.get("customer_name") or payload.get("customer_name") or ""),
+            "phone": str(order_data.get("phone") or payload.get("phone") or ""),
+            "address": str(order_data.get("address") or payload.get("address") or ""),
+            "comment": str(order_data.get("comment") or payload.get("comment") or ""),
+            "items": order_data.get("items") or payload.get("items") or [],
+            "created_at": str(order_data.get("created_at") or payload.get("created_at") or ""),
+        }
+        await db.save_synced_order(to_save)
+        log.info("Webhook saved order #%d (rest: %s, total: %.2f)", oid, to_save["restaurant_id"], to_save["total"])
+
+    return web.json_response({"ok": True, "order_id": oid})
+
+
+COURIER_AVATAR_CACHE: dict = {}
+AVATARS_DIR = "/var/www/partners-app/avatars"
+
+def _resolve_courier_by_id_or_tg_fast(courier_id: int = 0, courier_tg: int = 0) -> tuple[str, str, str]:
+    """
+    Возвращает (имя, телефон, фото) курьера для карточки заказа заведения.
+    Ни при каких обстоятельствах не возвращает данные клиента!
+    """
+    if not courier_id and not courier_tg:
+        return "", "", ""
+    c_name = ""
+    c_phone = ""
+    c_photo = ""
+    found_tg = courier_tg
+
+    if courier_id and courier_id in COURIER_AVATAR_CACHE:
+        c_photo = COURIER_AVATAR_CACHE[courier_id]
+    elif found_tg and found_tg in COURIER_AVATAR_CACHE:
+        c_photo = COURIER_AVATAR_CACHE[found_tg]
+
+    # 1. auth.db (admin_users)
+    for p in BACKEND_DB_PATHS if "BACKEND_DB_PATHS" in globals() else []:
+        if not os.path.exists(p):
+            continue
+        try:
+            conn = connect_sqlite_wal(p)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id, full_name, phone, username, telegram_id FROM admin_users WHERE id = ? OR telegram_id = ?",
+                (courier_id, str(courier_tg or courier_id))
+            ).fetchone()
+            conn.close()
+            if row:
+                c_name = (row["full_name"] or "").strip() or (row["username"] or "").strip()
+                c_phone = (row["phone"] or "").strip()
+                if row["telegram_id"]:
+                    try:
+                        found_tg = int(row["telegram_id"])
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
+
+    # 2. partners_bot.db (bot_users)
+    pdb = DB_PATH if "DB_PATH" in globals() else "partners_bot.db"
+    if os.path.exists(pdb) and (found_tg or not c_name or not c_phone):
+        try:
+            conn = connect_sqlite_wal(pdb)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT name, phone FROM bot_users WHERE telegram_id = ? OR telegram_id = ?",
+                (found_tg or courier_id, courier_id)
+            ).fetchone()
+            conn.close()
+            if row:
+                if not c_name and row["name"]:
+                    c_name = row["name"].strip()
+                if not c_phone and row["phone"]:
+                    c_phone = row["phone"].strip()
+        except Exception:
+            pass
+
+    # Avatar file resolution from static avatars folder
+    if not c_photo and found_tg:
+        p_tg = os.path.join(AVATARS_DIR, f"{found_tg}.jpg")
+        if os.path.exists(p_tg) and os.path.getsize(p_tg) > 100:
+            c_photo = f"/avatars/{found_tg}.jpg"
+
+    if not c_photo and courier_id:
+        p_cid = os.path.join(AVATARS_DIR, f"{courier_id}.jpg")
+        if os.path.exists(p_cid) and os.path.getsize(p_cid) > 100:
+            c_photo = f"/avatars/{courier_id}.jpg"
+
+    if not c_photo and c_name:
+        if c_name in COURIER_AVATAR_CACHE:
+            c_photo = COURIER_AVATAR_CACHE[c_name]
+        else:
+            p_name = os.path.join(AVATARS_DIR, f"{c_name.lower()}.jpg")
+            if os.path.exists(p_name) and os.path.getsize(p_name) > 100:
+                c_photo = f"/avatars/{c_name.lower()}.jpg"
+
+    return c_name, c_phone, c_photo
+
+
+async def handle_partner_orders(request: web.Request) -> web.Response:
+    """Возвращает синхронизированные заказы для ресторана или курьера в Mini App."""
+    restaurant_id = (request.query.get("restaurant_id") or "").strip()
+    courier_id_raw = (request.query.get("courier_id") or "0").strip()
+    try:
+        courier_id = int(courier_id_raw)
+    except ValueError:
+        courier_id = 0
+
+    limit = 100
+    try:
+        limit = min(int(request.query.get("limit") or 100), 200)
+    except ValueError:
+        pass
+
+    orders = await db.get_synced_orders(restaurant_id=restaurant_id, courier_id=courier_id, limit=limit)
+
+    def _read_from_order_db():
+        for opath in ORDER_DB_PATHS:
+            if not os.path.exists(opath):
+                continue
+            try:
+                conn = connect_sqlite_wal(opath)
+                cur = conn.cursor()
+                if restaurant_id:
+                    cur.execute("""
+                        SELECT id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items, created_at
+                        FROM orders WHERE restaurant_id = ? ORDER BY id DESC LIMIT ?
+                    """, (restaurant_id, limit))
+                elif courier_id > 0:
+                    cur.execute("""
+                        SELECT id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items, created_at
+                        FROM orders WHERE courier_id = ? OR (courier_id = 0 AND status IN ('confirmed', 'accepted', 'preparing', 'ready'))
+                        ORDER BY id DESC LIMIT ?
+                    """, (courier_id, limit))
+                else:
+                    cur.execute("""
+                        SELECT id, restaurant_id, courier_id, status, total, delivery_fee, customer_name, phone, address, comment, items, created_at
+                        FROM orders ORDER BY id DESC LIMIT ?
+                    """, (limit,))
+                rows = cur.fetchall()
+                conn.close()
+                res = []
+                for r in rows:
+                    items_val = []
+                    try:
+                        items_val = json.loads(r[10]) if r[10] else []
+                    except Exception:
+                        pass
+                    res.append({
+                        "id": r[0],
+                        "order_id": r[0],
+                        "restaurant_id": r[1],
+                        "courier_id": r[2] or 0,
+                        "status": r[3],
+                        "total": r[4],
+                        "delivery_fee": r[5],
+                        "customer_name": r[6],
+                        "phone": r[7],
+                        "address": r[8],
+                        "comment": r[9],
+                        "items": items_val,
+                        "created_at": r[11],
+                    })
+                return res
+            except Exception as e:
+                log.error("handle_partner_orders read order.db failed: %s", e)
+        return []
+
+    order_db_items = await asyncio.to_thread(_read_from_order_db)
+
+    combined = {}
+    for o in order_db_items:
+        combined[o["id"]] = o
+
+    for so in orders:
+        oid = so["id"]
+        if oid in combined:
+            c = combined[oid]
+            if not c.get("courier_id") and so.get("courier_id"):
+                c["courier_id"] = so["courier_id"]
+            if not c.get("items") and so.get("items_json"):
+                try:
+                    c["items"] = json.loads(so["items_json"])
+                except Exception:
+                    pass
+            continue
+
+        items_val = []
+        try:
+            items_val = json.loads(so.get("items_json") or "[]")
+        except Exception:
+            pass
+        item = {
+            "id": oid,
+            "order_id": oid,
+            "restaurant_id": so.get("restaurant_id") or "",
+            "courier_id": so.get("courier_id") or 0,
+            "status": so.get("status") or "new",
+            "total": so.get("total") or 0.0,
+            "delivery_fee": so.get("delivery_fee") or 0.0,
+            "customer_name": so.get("customer_name") or "",
+            "phone": so.get("phone") or "",
+            "address": so.get("address") or "",
+            "comment": so.get("comment") or "",
+            "items": items_val,
+            "created_at": so.get("created_at") or "",
+        }
+        combined[oid] = item
+
+    result_list = sorted(combined.values(), key=lambda x: x["id"], reverse=True)[:limit]
+
+    # Resolve courier name, phone & photo, and enforce customer privacy for restaurant
+    courier_cache = {}
+    for item in result_list:
+        cid = item.get("courier_id") or 0
+        c_name = ""
+        c_phone = ""
+        c_photo = ""
+        if cid:
+            if cid not in courier_cache:
+                courier_cache[cid] = _resolve_courier_by_id_or_tg_fast(courier_id=cid)
+            c_name, c_phone, c_photo = courier_cache[cid]
+        item["courier_name"] = c_name
+        item["courier_phone"] = c_phone
+        item["courier_photo"] = c_photo
+        item["courier_assigned"] = bool(cid and (c_name or c_phone))
+
+        # PRIVACY SANITIZATION:
+        # Ресторан не должен видеть никаких данных клиента (ни имя, ни телефон, ни адрес)
+        if restaurant_id:
+            item["customer_name"] = ""
+            item["phone"] = ""
+            item["address"] = ""
+
+    return web.json_response({
+        "ok": True,
+        "orders": result_list,
+        "count": len(result_list),
+    })
+
+
+async def handle_update_partner_order_status(request: web.Request) -> web.Response:
+    """Обновляет статус заказа от имени кухни или курьера в Mini App."""
+    order_id_raw = request.match_info.get("id") or request.query.get("id") or "0"
+    try:
+        order_id = int(order_id_raw)
+    except ValueError:
+        return web.json_response({"ok": False, "error": "Invalid order id"}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    new_status = (body.get("status") or "").strip().lower()
+    courier_id = int(body.get("courier_id") or 0)
+    courier_photo = (body.get("courier_photo") or "").strip()
+    if courier_photo and courier_id:
+        COURIER_AVATAR_CACHE[courier_id] = courier_photo
+
+    if not new_status:
+        return web.json_response({"ok": False, "error": "Missing status"}, status=400)
+
+    log.info("handle_update_partner_order_status: order_id=%d status=%s courier_id=%d photo=%s", order_id, new_status, courier_id, bool(courier_photo))
+
+    # 1. Update in synced_orders
+    await db.update_synced_order_status(order_id, new_status, courier_id)
+
+    # 2. Update directly in order.db if available
+    db_status = "accepted" if new_status in ("confirmed", "accepted") else new_status
+    for opath in ORDER_DB_PATHS:
+        if not os.path.exists(opath):
+            continue
+        try:
+            conn = connect_sqlite_wal(opath)
+            cur = conn.cursor()
+            if courier_id > 0:
+                cur.execute("UPDATE orders SET status = ?, courier_id = ?, updated_at = datetime('now') WHERE id = ?", (db_status, courier_id, order_id))
+            else:
+                cur.execute("UPDATE orders SET status = ?, updated_at = datetime('now') WHERE id = ?", (db_status, order_id))
+            conn.commit()
+            conn.close()
+            log.info("Updated order.db directly for order %d -> %s", order_id, db_status)
+        except Exception as e:
+            log.error("Failed to update order.db directly: %s", e)
+
+    # 3. Call backend orders service PATCH if available
+    try:
+        timeout = aiohttp.ClientTimeout(total=3.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            patch_url = f"{BACKEND_URL}/api/orders/{order_id}/status"
+            await session.patch(patch_url, json={"status": db_status})
+    except Exception as e:
+        log.debug("Backend PATCH status forward note: %s", e)
+
+    return web.json_response({"ok": True, "order_id": order_id, "status": new_status, "courier_id": courier_id})
+
+
+async def handle_partner_menu(request: web.Request) -> web.Response:
+    """Возвращает полноценное меню ресторана из catalog.db."""
+    restaurant_id = (request.query.get("restaurant_id") or "").strip()
+    if not restaurant_id:
+        restaurant_id = "test_rest_01"
+
+    def _get_menu():
+        for cpath in CATALOG_DB_PATHS:
+            if not os.path.exists(cpath):
+                continue
+            try:
+                conn = connect_sqlite_wal(cpath)
+                cur = conn.cursor()
+                
+                # Проверим количество блюд; если пусто или мало, скопируем демо-набор из других заведений
+                cur.execute("SELECT count(*) FROM products WHERE restaurant_id = ?", (restaurant_id,))
+                cnt = cur.fetchone()[0]
+                if cnt < 5 and restaurant_id in ("test_rest_01", "test_rest"):
+                    cur.execute("""
+                        INSERT OR IGNORE INTO products (id, restaurant_id, name, description, price, img, category, weight, calories, proteins, fats, carbs, ingredients, is_available)
+                        SELECT 'demo-' || id, ?, name, description, price, img, category, weight, calories, proteins, fats, carbs, ingredients, 1
+                        FROM products WHERE restaurant_id != ? AND category IN ('Салаты', 'Выпечка', 'Сванские блюда', 'Десерты', 'Горячее', 'Супы', 'Напитки', 'Бургеры', 'Пицца')
+                        GROUP BY category LIMIT 14
+                    """, (restaurant_id, restaurant_id))
+                    conn.commit()
+
+                cur.execute("""
+                    SELECT id, name, description, price, img, category, weight, calories, proteins, fats, carbs, ingredients, is_available
+                    FROM products WHERE restaurant_id = ? ORDER BY category, id
+                """, (restaurant_id,))
+                rows = cur.fetchall()
+                conn.close()
+
+                dishes = []
+                categories = set()
+                for r in rows:
+                    cat = r[5] or "Общее"
+                    categories.add(cat)
+                    dishes.append({
+                        "id": r[0],
+                        "name": r[1],
+                        "description": r[2],
+                        "price": float(r[3] or 0),
+                        "img": r[4] or "",
+                        "category": cat,
+                        "weight": r[6] or "",
+                        "calories": r[7] or "",
+                        "proteins": r[8] or "",
+                        "fats": r[9] or "",
+                        "carbs": r[10] or "",
+                        "ingredients": r[11] or "",
+                        "is_available": bool(r[12]),
+                    })
+                return {"categories": sorted(list(categories)), "dishes": dishes}
+            except Exception as e:
+                log.error("handle_partner_menu error: %s", e)
+        return {"categories": [], "dishes": []}
+
+    res = await asyncio.to_thread(_get_menu)
+    return web.json_response({"ok": True, "restaurant_id": restaurant_id, **res})
+
+
+async def handle_partner_dish_toggle(request: web.Request) -> web.Response:
+    """Переключает статус доступности блюда (стоп-лист)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dish_id = str(body.get("dish_id") or "").strip()
+    is_available = bool(body.get("is_available"))
+    if not dish_id:
+        return web.json_response({"ok": False, "error": "dish_id required"}, status=400)
+
+    def _toggle():
+        for cpath in CATALOG_DB_PATHS:
+            if not os.path.exists(cpath):
+                continue
+            try:
+                conn = connect_sqlite_wal(cpath)
+                cur = conn.cursor()
+                cur.execute("UPDATE products SET is_available = ? WHERE id = ?", (1 if is_available else 0, dish_id))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                log.error("handle_partner_dish_toggle failed: %s", e)
+        return False
+
+    ok = await asyncio.to_thread(_toggle)
+    return web.json_response({"ok": ok, "dish_id": dish_id, "is_available": is_available})
+
+
+async def handle_partner_dish_update(request: web.Request) -> web.Response:
+    """Обновляет цену, граммовку, описание и категорию блюда в catalog.db."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dish_id = str(body.get("id") or body.get("dish_id") or "").strip()
+    if not dish_id:
+        return web.json_response({"ok": False, "error": "dish_id required"}, status=400)
+
+    price = float(body.get("price") or 0)
+    weight = str(body.get("weight") or "").strip()
+    category = str(body.get("category") or "").strip()
+    name = body.get("name")
+    description = body.get("description")
+    is_available = 1 if body.get("is_available", True) else 0
+
+    def _update():
+        for cpath in CATALOG_DB_PATHS:
+            if not os.path.exists(cpath):
+                continue
+            try:
+                conn = connect_sqlite_wal(cpath)
+                cur = conn.cursor()
+                name_str = json.dumps(name, ensure_ascii=False) if isinstance(name, dict) else str(name or "")
+                desc_str = json.dumps(description, ensure_ascii=False) if isinstance(description, dict) else str(description or "")
+
+                cur.execute("""
+                    UPDATE products SET
+                        price = CASE WHEN ? > 0 THEN ? ELSE price END,
+                        weight = CASE WHEN ? != '' THEN ? ELSE weight END,
+                        category = CASE WHEN ? != '' THEN ? ELSE category END,
+                        name = CASE WHEN ? != '' THEN ? ELSE name END,
+                        description = CASE WHEN ? != '' THEN ? ELSE description END,
+                        is_available = ?
+                    WHERE id = ?
+                """, (price, price, weight, weight, category, category, name_str, name_str, desc_str, desc_str, is_available, dish_id))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                log.error("handle_partner_dish_update failed: %s", e)
+        return False
+
+    ok = await asyncio.to_thread(_update)
+    return web.json_response({"ok": ok, "dish_id": dish_id})
+
+
+async def handle_partner_dish_create(request: web.Request) -> web.Response:
+    """Создает новое блюдо в catalog.db."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    restaurant_id = str(body.get("restaurant_id") or "test_rest_01").strip()
+    name = body.get("name") or "Новое блюдо"
+    price = float(body.get("price") or 0.0)
+    category = str(body.get("category") or "Основные").strip()
+    weight = str(body.get("weight") or "").strip()
+    description = body.get("description") or ""
+    img = str(body.get("img") or "/uploads/ed63010fa7fe49e7b6d09a5e7a990577.jpg").strip()
+
+    import random
+    dish_id = f"prod-{int(time.time())}-{random.randint(100, 999)}"
+
+    def _create():
+        for cpath in CATALOG_DB_PATHS:
+            if not os.path.exists(cpath):
+                continue
+            try:
+                conn = connect_sqlite_wal(cpath)
+                cur = conn.cursor()
+                name_str = json.dumps(name, ensure_ascii=False) if isinstance(name, dict) else json.dumps({"ru": str(name), "en": str(name), "ka": str(name)}, ensure_ascii=False)
+                desc_str = json.dumps(description, ensure_ascii=False) if isinstance(description, dict) else json.dumps({"ru": str(description), "en": str(description), "ka": str(description)}, ensure_ascii=False)
+                cur.execute("""
+                    INSERT INTO products (id, restaurant_id, name, description, price, img, category, weight, is_available)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, (dish_id, restaurant_id, name_str, desc_str, price, img, category, weight))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                log.error("handle_partner_dish_create failed: %s", e)
+        return False
+
+    ok = await asyncio.to_thread(_create)
+    return web.json_response({"ok": ok, "dish_id": dish_id})
+
+
+async def handle_partner_stats(request: web.Request) -> web.Response:
+    """Возвращает детальную статистику и аналитику по заказам."""
+    restaurant_id = (request.query.get("restaurant_id") or "").strip()
+    courier_id_raw = (request.query.get("courier_id") or "0").strip()
+    period = (request.query.get("period") or "week").strip()
+    try:
+        courier_id = int(courier_id_raw)
+    except ValueError:
+        courier_id = 0
+
+    def _calc_stats():
+        for opath in ORDER_DB_PATHS:
+            if not os.path.exists(opath):
+                continue
+            try:
+                conn = connect_sqlite_wal(opath)
+                cur = conn.cursor()
+
+                where_clauses = []
+                params = []
+                if restaurant_id:
+                    where_clauses.append("restaurant_id = ?")
+                    params.append(restaurant_id)
+                elif courier_id > 0:
+                    where_clauses.append("courier_id = ?")
+                    params.append(courier_id)
+
+                if period == "today":
+                    where_clauses.append("date(created_at) = date('now')")
+                elif period == "week":
+                    where_clauses.append("datetime(created_at) >= datetime('now', '-7 days')")
+                elif period == "month":
+                    where_clauses.append("datetime(created_at) >= datetime('now', '-30 days')")
+
+                where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+                cur.execute(f"""
+                    SELECT id, status, total, delivery_fee, tips, created_at, items
+                    FROM orders {where_sql} ORDER BY id DESC
+                """, tuple(params))
+                orders = cur.fetchall()
+
+                # Fallback: если фильтр пуст, заберем все заказы, чтобы не показывать пустой экран
+                if not orders and period != "all":
+                    fallback_where = f"WHERE {'restaurant_id = ?' if restaurant_id else 'courier_id = ?'}" if (restaurant_id or courier_id > 0) else ""
+                    cur.execute(f"SELECT id, status, total, delivery_fee, tips, created_at, items FROM orders {fallback_where} ORDER BY id DESC", tuple(params))
+                    orders = cur.fetchall()
+
+                conn.close()
+
+                total_revenue = 0.0
+                delivered_count = 0
+                active_count = 0
+                cancelled_count = 0
+                dish_counts = {}
+                daily_map = {}
+                courier_earnings = 0.0
+                tips_total = 0.0
+                delivery_trips = []
+
+                import datetime
+                for i in range(6, -1, -1):
+                    d = datetime.date.today() - datetime.timedelta(days=i)
+                    d_str = d.strftime("%Y-%m-%d")
+                    day_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][d.weekday()]
+                    daily_map[d_str] = {"date": d_str, "day": f"{day_ru} {d.strftime('%d.%m')}", "revenue": 0.0, "count": 0}
+
+                for o in orders:
+                    oid, st, tot, d_fee, tips_val, c_at, items_json = o
+                    tot = float(tot or 0.0)
+                    d_fee_f = float(d_fee or 8.0)
+                    tips_f = float(tips_val or 0.0)
+                    st = (st or "new").lower()
+                    if st == "delivered":
+                        delivered_count += 1
+                        total_revenue += tot
+                        courier_earnings += (d_fee_f + tips_f)
+                        tips_total += tips_f
+                        delivery_trips.append({
+                            "id": oid,
+                            "delivery_fee": d_fee_f,
+                            "tips": tips_f,
+                            "created_at": c_at,
+                        })
+
+                        c_date = (c_at or "")[:10]
+                        if c_date in daily_map:
+                            daily_map[c_date]["revenue"] += tot
+                            daily_map[c_date]["count"] += 1
+
+                        if items_json:
+                            try:
+                                items = json.loads(items_json) if isinstance(items_json, str) else items_json
+                                for it in items:
+                                    name_val = it.get("name") or it.get("title") or "Блюдо"
+                                    name_str = name_val if isinstance(name_val, str) else name_val.get("ru") or str(name_val)
+                                    qty = int(it.get("quantity") or 1)
+                                    price = float(it.get("price") or 0.0)
+                                    if name_str not in dish_counts:
+                                        dish_counts[name_str] = {"name": name_str, "count": 0, "revenue": 0.0}
+                                    dish_counts[name_str]["count"] += qty
+                                    dish_counts[name_str]["revenue"] += price * qty
+                            except Exception:
+                                pass
+                    elif st in ("new", "pending", "confirmed", "accepted", "preparing", "ready", "delivering", "on_the_way"):
+                        active_count += 1
+                    elif st == "cancelled":
+                        cancelled_count += 1
+
+                avg_check = round(total_revenue / delivered_count, 1) if delivered_count > 0 else 0.0
+                rest_net = round(total_revenue * 0.9, 1)
+                platform_fee = round(total_revenue * 0.1, 1)
+
+                top_dishes = sorted(dish_counts.values(), key=lambda x: x["count"], reverse=True)[:5]
+                chart_data = list(daily_map.values())
+
+                return {
+                    "revenue": round(total_revenue, 1),
+                    "courier_earnings": round(courier_earnings, 1),
+                    "tips_total": round(tips_total, 1),
+                    "delivery_trips": delivery_trips,
+                    "delivered_count": delivered_count,
+                    "active_count": active_count,
+                    "cancelled_count": cancelled_count,
+                    "total_orders": len(orders),
+                    "avg_check": avg_check,
+                    "restaurant_net": rest_net,
+                    "platform_fee": platform_fee,
+                    "top_dishes": top_dishes,
+                    "daily_chart": chart_data,
+                }
+            except Exception as e:
+                log.error("handle_partner_stats error: %s", e)
+        return {"revenue": 0.0, "delivered_count": 0, "active_count": 0, "cancelled_count": 0, "total_orders": 0, "avg_check": 0.0, "top_dishes": [], "daily_chart": []}
+
+    res = await asyncio.to_thread(_calc_stats)
+    return web.json_response({"ok": True, "period": period, "stats": res})
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        resp = web.Response(status=200)
+    else:
+        resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, PATCH, DELETE"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Bot-Security-Token"
+    return resp
+
+
+async def handle_rush_status(request: web.Request) -> web.Response:
+    restaurant_id = request.query.get("restaurant_id", "").strip()
+    rush_mode = 0
+    if restaurant_id and db:
+        rush_mode = await db.get_partner_rush_mode(restaurant_id)
+
+    now_geo = datetime.now(GEORGIA_TZ)
+    hour = now_geo.hour
+    is_evening_schedule = (18 <= hour < 22)
+
+    if rush_mode == 1:
+        is_rush = True
+        reason = "manual_on"
+    elif rush_mode == -1:
+        is_rush = False
+        reason = "manual_off"
+    else:
+        is_rush = is_evening_schedule
+        reason = "evening_rush" if is_evening_schedule else "normal"
+
+    data = {
+        "is_rush": is_rush,
+        "reason": reason,
+        "rush_mode": rush_mode,
+        "current_hour": hour,
+        "tbilisi_time": now_geo.strftime("%Y-%m-%d %H:%M:%S"),
+        "delivery_min": 45 if is_rush else 25,
+        "delivery_max": 65 if is_rush else 40,
+    }
+    return web.json_response(data, headers={"Access-Control-Allow-Origin": "*"})
+
+
 def make_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/api/bot/v1/rush-status", handle_rush_status)
     app.router.add_post("/api/bot/v1/restaurant/new-order", handle_new_order)
     app.router.add_post("/api/bot/v1/restaurant/courier-arrived", handle_courier_arrived)
     app.router.add_post("/api/bot/v1/couriers/broadcast", handle_broadcast)
@@ -8207,6 +11760,18 @@ def make_app() -> web.Application:
     app.router.add_post("/api/bot/v1/orders/review", handle_order_review)
     app.router.add_post("/api/bot/v1/orders/tips", handle_order_tips)
     app.router.add_get("/api/bot/v1/partners", handle_partners_list)
+    # Новые эндпоинты для интеграции Mini App и вебхуков бэкенда
+    app.router.add_post("/api/bot/v1/auth/session", handle_auth_session)
+    app.router.add_post("/api/bot/v1/webhook/orders", handle_gateway_webhook)
+    app.router.add_get("/api/bot/v1/partner/orders", handle_partner_orders)
+    app.router.add_post("/api/bot/v1/partner/order/{id}/status", handle_update_partner_order_status)
+    app.router.add_patch("/api/bot/v1/partner/order/{id}/status", handle_update_partner_order_status)
+    # Эндпоинты для полноценного меню и аналитики
+    app.router.add_get("/api/bot/v1/partner/menu", handle_partner_menu)
+    app.router.add_post("/api/bot/v1/partner/menu/toggle", handle_partner_dish_toggle)
+    app.router.add_post("/api/bot/v1/partner/menu/update", handle_partner_dish_update)
+    app.router.add_post("/api/bot/v1/partner/menu/create", handle_partner_dish_create)
+    app.router.add_get("/api/bot/v1/partner/stats", handle_partner_stats)
     return app
 
 
@@ -8248,6 +11813,12 @@ async def main():
     db = Database(DB_PATH)
     await db.connect()
 
+    # Синхронизация существующих пользователей бота в бэкенд и удаление фантомных курьеров
+    try:
+        await sync_all_bot_users_to_backend()
+    except Exception as e_sync:
+        log.error("Failed startup sync_all_bot_users_to_backend: %s", e_sync)
+
     # Сброс всех курьеров в офлайн убран, чтобы избежать рассинхронизации клавиатур
     # и статусов при перезапусках бота в процессе обновления.
     log.info("Courier status reset on startup bypassed")
@@ -8272,8 +11843,18 @@ async def main():
         await bot.set_my_commands([
             BotCommand.model_validate({
                 "command": "start",
-                "description": "Запустить бота / Главное меню",
+                "description": "Запустить бота",
                 "icon_custom_emoji_id": "5384244502040975393",
+            }),
+            BotCommand.model_validate({
+                "command": "menu",
+                "description": "Главное меню",
+                "icon_custom_emoji_id": "5384222159621102491",
+            }),
+            BotCommand.model_validate({
+                "command": "profile",
+                "description": "Мой профиль",
+                "icon_custom_emoji_id": "5381848533060067195",
             }),
             BotCommand.model_validate({
                 "command": "reset",
@@ -8332,9 +11913,12 @@ async def main():
         partners_db_path=DB_PATH,
         emoji=CUSTOM_EMOJI,
         open_payouts=_open_admin_payouts,
-        is_super_admin=lambda tg: db.is_super_admin(tg),
+        is_super_admin=db.is_super_admin,
         ops={
+            "assign_courier": admin_assign_courier,
             "cancel_order": admin_cancel_order,
+            "delete_order": admin_delete_order,
+            "bulk_delete_orders": admin_bulk_delete_orders,
             "ping_couriers": admin_ping_order_couriers,
             "rebroadcast": admin_rebroadcast_order,
             "force_offline": admin_force_courier_offline,
@@ -8342,7 +11926,7 @@ async def main():
             "unblock_courier": admin_unblock_courier,
             "set_restaurant_open": admin_set_restaurant_open,
             "send_message": admin_send_partner_message,
-            "get_courier_block": lambda tg: db.get_courier_block(tg),
+            "get_courier_block": db.get_courier_block,
         },
     )
     sla_stop = asyncio.Event()

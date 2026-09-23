@@ -19,9 +19,9 @@ UI: dict[str, dict[str, str]] = {
         "btn_accept": "Принять",
         "btn_courier_refuse": "Отказаться",
         "btn_open_details": "Открыть подробности",
-        "btn_courier_arrived_rest": "Я на месте",
+        "btn_courier_arrived_rest": "Прибыл в ресторан",
         "btn_courier_picked_up": "Забрал заказ",
-        "btn_courier_delivered": "Заказ доставлен",
+        "btn_courier_delivered": "Вручил клиенту",
         "btn_processing": "⏳ Обработка...",
         "btn_back": "← Назад",
         "btn_refuse_yes": "Да, отказаться",
@@ -57,8 +57,8 @@ UI: dict[str, dict[str, str]] = {
         "caption_courier_refused": "Вы отказались от заказа #{order_id}",
         "caption_reason_line": "Причина · {reason}",
         "caption_courier_snooze": "Напомним о заказе #{order_id} через {n} мин ({t}).",
-        "snooze_reminder": "Напоминание: заказ #{order_id} ещё доступен — можно принять.",
-        "courier_ready_notify": "Заказ #{order_id} готов к выдаче! Можно нажать «Забрал заказ».",
+        "snooze_reminder": "Напоминание: заказ <b>#{order_id}</b> ещё доступен — можно принять.",
+        "courier_ready_notify": "Заказ <b>#{order_id}</b> готов к выдаче! Можно нажать «Забрал заказ».",
         "courier_phase_to_rest": "К ресторану",
         "courier_phase_at_rest": "На месте у ресторана",
         "courier_phase_wait": "Ждём готовности",
@@ -104,10 +104,16 @@ UI: dict[str, dict[str, str]] = {
         "caption_rest_refused": "Ресторан отказался от заказа.",
         "courier_arrived_notify": "Курьер на месте! Если заказ готов — нажмите «Готов к выдаче».",
         "courier_arrived_body": (
+            "Курьер <b>{name}</b> прибыл в ресторан за заказом <b>#{order_id}</b> и ожидает готовности.\n"
+            "Когда заказ будет готов — нажмите «Готов к выдаче» на карточке заказа."
+        ),
+        "courier_arrived_ready_body": (
             "Курьер <b>{name}</b> прибыл в ресторан за заказом <b>#{order_id}</b>.\n"
-            "Если заказ готов — нажмите «Готов к выдаче» на карточке заказа."
+            "Заказ готов к выдаче — передайте его курьеру."
         ),
         "courier_arrived_title": "Курьер на месте!",
+        "alert_order_already_delivered": "Заказ #{order_id} уже доставлен!",
+        "alert_already_picked_up": "Заказ #{order_id} уже у вас. Везите клиенту!",
         "default_courier_name": "Курьер",
         "cancelled_by_restaurant": "Ресторан",
         "cancelled_by_admin": "Администратор",
@@ -133,11 +139,13 @@ UI: dict[str, dict[str, str]] = {
         "banner_deliveries": "{n} доставок",
         "comment_none_short": "нет",
         "courier_assign_reminder": (
-            "<i>Внимание:</i> Заказ <b>#{order_id}</b> ожидает назначения. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>Внимание:</b> Заказ <b>#{order_id}</b> ожидает назначения. "
             "Для принятия в работу используйте карточку заказа выше."
         ),
         "courier_assign_reminder_urgent": (
-            "<i>Внимание:</i> Заказ <b>#{order_id}</b> ожидает назначения. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>Внимание:</b> Заказ <b>#{order_id}</b> ожидает назначения. "
             "Для принятия в работу используйте карточку заказа выше."
         ),
         "admin_assign_alert": (
@@ -152,6 +160,23 @@ UI: dict[str, dict[str, str]] = {
             "Заказ <b>#{order_id}</b> · {restaurant}\n"
             "Повторное напоминание (+{n} мин без назначения)."
         ),
+        # Новые функции: Время готовки, Навигатор, Стоп-лист, Сводка смены
+        "btn_prep_10": "~10 мин",
+        "btn_prep_15": "~15 мин",
+        "btn_prep_20": "~20 мин",
+        "btn_prep_default": "▶ Начать готовку",
+        "alert_prep_time_set": "✅ Заказ принят! Время приготовления: {n} мин",
+        "btn_nav_google": "🗺 Навигатор",
+        "btn_call_phone": "📞 Позвонить",
+        "shift_summary_title": "<b>Смена завершена!</b>",
+        "shift_summary_orders": "<b>Выполнено доставок:</b> {n}",
+        "shift_summary_income": "<b>Заработок:</b> {amount} ₾",
+        "shift_summary_tips": "<b>Чаевые:</b> {amount} ₾",
+        "shift_summary_total": "<b>Итого за сегодня:</b> {amount} ₾",
+        "btn_stoplist": "Стоп-лист",
+        "stoplist_title": "<b>Управление стоп-листом блюд</b>\nНажмите на блюдо, чтобы изменить его доступность:",
+        "alert_dish_available": "🟢 «{name}» теперь доступно в меню",
+        "alert_dish_stopped": "🔴 «{name}» добавлено в стоп-лист",
     },
     "en": {
         "courier_new_order_title": "NEW ORDER #{order_id}",
@@ -167,9 +192,9 @@ UI: dict[str, dict[str, str]] = {
         "btn_accept": "Accept",
         "btn_courier_refuse": "Decline",
         "btn_open_details": "Open details",
-        "btn_courier_arrived_rest": "I'm here",
+        "btn_courier_arrived_rest": "At restaurant",
         "btn_courier_picked_up": "Picked up",
-        "btn_courier_delivered": "Delivered",
+        "btn_courier_delivered": "Delivered to client",
         "btn_processing": "⏳ Processing...",
         "btn_back": "← Back",
         "btn_refuse_yes": "Yes, decline",
@@ -205,8 +230,8 @@ UI: dict[str, dict[str, str]] = {
         "caption_courier_refused": "You declined order #{order_id}",
         "caption_reason_line": "Reason · {reason}",
         "caption_courier_snooze": "We'll remind you about order #{order_id} in {n} min ({t}).",
-        "snooze_reminder": "Reminder: order #{order_id} is still available — you can accept it.",
-        "courier_ready_notify": "Order #{order_id} is ready for pickup! Tap “Picked up”.",
+        "snooze_reminder": "Reminder: order <b>#{order_id}</b> is still available — you can accept it.",
+        "courier_ready_notify": "Order <b>#{order_id}</b> is ready for pickup! Tap “Picked up”.",
         "courier_phase_to_rest": "To restaurant",
         "courier_phase_at_rest": "At restaurant",
         "courier_phase_wait": "Waiting for kitchen",
@@ -251,10 +276,16 @@ UI: dict[str, dict[str, str]] = {
         "caption_rest_refused": "Restaurant declined the order.",
         "courier_arrived_notify": "Courier is here! If ready — tap “Ready for pickup”.",
         "courier_arrived_body": (
+            "Courier <b>{name}</b> arrived at the restaurant for order <b>#{order_id}</b> and is waiting.\n"
+            "When ready — press “Ready for pickup” on the order card."
+        ),
+        "courier_arrived_ready_body": (
             "Courier <b>{name}</b> arrived at the restaurant for order <b>#{order_id}</b>.\n"
-            "If ready — tap “Ready for pickup” on the order card."
+            "Order is ready for pickup — please hand it over to the courier."
         ),
         "courier_arrived_title": "Courier is here!",
+        "alert_order_already_delivered": "Order #{order_id} is already delivered!",
+        "alert_already_picked_up": "Order #{order_id} is already with you. Deliver to client!",
         "default_courier_name": "Courier",
         "cancelled_by_restaurant": "Restaurant",
         "cancelled_by_admin": "Administrator",
@@ -280,11 +311,13 @@ UI: dict[str, dict[str, str]] = {
         "banner_deliveries": "{n} deliveries",
         "comment_none_short": "none",
         "courier_assign_reminder": (
-            "<i>Attention:</i> Order <b>#{order_id}</b> is awaiting assignment. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>Attention:</b> Order <b>#{order_id}</b> is awaiting assignment. "
             "Use the order card above to accept it."
         ),
         "courier_assign_reminder_urgent": (
-            "<i>Attention:</i> Order <b>#{order_id}</b> is awaiting assignment. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>Attention:</b> Order <b>#{order_id}</b> is awaiting assignment. "
             "Use the order card above to accept it."
         ),
         "admin_assign_alert": (
@@ -299,6 +332,23 @@ UI: dict[str, dict[str, str]] = {
             "Order <b>#{order_id}</b> · {restaurant}\n"
             "Second reminder (+{n} min without assignment)."
         ),
+        # New features: Prep time, Navigation, Stop-list, Shift summary
+        "btn_prep_10": "~10 min",
+        "btn_prep_15": "~15 min",
+        "btn_prep_20": "~20 min",
+        "btn_prep_default": "▶ Start cooking",
+        "alert_prep_time_set": "✅ Order accepted! Prep time: {n} min",
+        "btn_nav_google": "🗺 Navigator",
+        "btn_call_phone": "📞 Call",
+        "shift_summary_title": "<b>Shift completed!</b>",
+        "shift_summary_orders": "<b>Deliveries today:</b> {n}",
+        "shift_summary_income": "<b>Earnings:</b> {amount} ₾",
+        "shift_summary_tips": "<b>Tips:</b> {amount} ₾",
+        "shift_summary_total": "<b>Total for shift:</b> {amount} ₾",
+        "btn_stoplist": "Stop-list",
+        "stoplist_title": "<b>Stop-list management</b>\nTap a dish to toggle its availability:",
+        "alert_dish_available": "🟢 “{name}” is now available in menu",
+        "alert_dish_stopped": "🔴 “{name}” added to stop-list",
     },
     "ka": {
         "courier_new_order_title": "ახალი შეკვეთა #{order_id}",
@@ -314,9 +364,9 @@ UI: dict[str, dict[str, str]] = {
         "btn_accept": "მიღება",
         "btn_courier_refuse": "უარი",
         "btn_open_details": "დეტალები",
-        "btn_courier_arrived_rest": "ადგილზე ვარ",
+        "btn_courier_arrived_rest": "რესტორანში მივედი",
         "btn_courier_picked_up": "შეკვეთა ავიღე",
-        "btn_courier_delivered": "მიწოდებულია",
+        "btn_courier_delivered": "კლიენტს ჩავაბარე",
         "btn_processing": "⏳ მუშავდება...",
         "btn_back": "← უკან",
         "btn_refuse_yes": "დიახ, უარი",
@@ -352,8 +402,8 @@ UI: dict[str, dict[str, str]] = {
         "caption_courier_refused": "თქვენ უარი თქვით შეკვეთაზე #{order_id}",
         "caption_reason_line": "მიზეზი · {reason}",
         "caption_courier_snooze": "შეგახსენებთ შეკვეთას #{order_id} {n} წუთში ({t}).",
-        "snooze_reminder": "შეხსენება: შეკვეთა #{order_id} ჯერ კიდევ ხელმისაწვდომია — შეგიძლიათ მიიღოთ.",
-        "courier_ready_notify": "შეკვეთა #{order_id} მზადაა გასაცემად! დააჭირეთ „შეკვეთა ავიღე“.",
+        "snooze_reminder": "შეხსენება: შეკვეთა <b>#{order_id}</b> ჯერ კიდევ ხელმისაწვდომია — შეგიძლიათ მიიღოთ.",
+        "courier_ready_notify": "შეკვეთა <b>#{order_id}</b> მზადაა გასაცემად! დააჭირეთ „შეკვეთა ავიღე“.",
         "courier_phase_to_rest": "რესტორნისკენ",
         "courier_phase_at_rest": "რესტორანთან",
         "courier_phase_wait": "ველოდებით სამზარეულოს",
@@ -398,10 +448,16 @@ UI: dict[str, dict[str, str]] = {
         "caption_rest_refused": "რესტორანმა უარი თქვა შეკვეთაზე.",
         "courier_arrived_notify": "კურიერი ადგილზეა! თუ მზადაა — დააჭირეთ „მზადაა გასაცემად“.",
         "courier_arrived_body": (
+            "კურიერი <b>{name}</b> მივიდა რესტორანში შეკვეთისთვის <b>#{order_id}</b> და ელოდება მზადყოფნას.\n"
+            "როცა მზად იქნება — დააჭირეთ „მზადაა გასაცემად“ შეკვეთის ბარათზე."
+        ),
+        "courier_arrived_ready_body": (
             "კურიერი <b>{name}</b> მივიდა რესტორანში შეკვეთისთვის <b>#{order_id}</b>.\n"
-            "თუ მზადაა — დააჭირეთ „მზადაა გასაცემად“ შეკვეთის ბარათზე."
+            "შეკვეთა მზადაა გასაცემად — გადაეცით კურიერს."
         ),
         "courier_arrived_title": "კურიერი ადგილზეა!",
+        "alert_order_already_delivered": "შეკვეთა #{order_id} უკვე მიწოდებულია!",
+        "alert_already_picked_up": "შეკვეთა #{order_id} უკვე თქვენთანაა. მიიტანეთ კლიენტთან!",
         "default_courier_name": "კურიერი",
         "cancelled_by_restaurant": "რესტორანი",
         "cancelled_by_admin": "ადმინისტრატორი",
@@ -427,11 +483,13 @@ UI: dict[str, dict[str, str]] = {
         "banner_deliveries": "{n} მიწოდება",
         "comment_none_short": "არა",
         "courier_assign_reminder": (
-            "<i>ყურადღება:</i> შეკვეთა <b>#{order_id}</b> ელოდება დანიშვნას. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>ყურადღება:</b> შეკვეთა <b>#{order_id}</b> ელოდება დანიშვნას. "
             "მისაღებად გამოიყენეთ ზემოთ მოცემული ბარათი."
         ),
         "courier_assign_reminder_urgent": (
-            "<i>ყურადღება:</i> შეკვეთა <b>#{order_id}</b> ელოდება დანიშვნას. "
+            '<tg-emoji emoji-id="5384244502040975393">🟢</tg-emoji> '
+            "<b>ყურადღება:</b> შეკვეთა <b>#{order_id}</b> ელოდება დანიშვნას. "
             "მისაღებად გამოიყენეთ ზემოთ მოცემული ბარათი."
         ),
         "admin_assign_alert": (
@@ -446,6 +504,23 @@ UI: dict[str, dict[str, str]] = {
             "შეკვეთა <b>#{order_id}</b> · {restaurant}\n"
             "განმეორებითი შეხსენება (+{n} წთ დანიშვნის გარეშე)."
         ),
+        # ახალი ფუნქციები: მომზადების დრო, ნავიგატორი, სტოპ-ლისტი, ცვლის ანგარიში
+        "btn_prep_10": "~10 წთ",
+        "btn_prep_15": "~15 წთ",
+        "btn_prep_20": "~20 წთ",
+        "btn_prep_default": "▶ მომზადების დაწყება",
+        "alert_prep_time_set": "✅ შეკვეთა მიღებულია! მომზადების დრო: {n} წთ",
+        "btn_nav_google": "🗺 ნავიგაცია",
+        "btn_call_phone": "📞 დარეკვა",
+        "shift_summary_title": "<b>ცვლა დასრულდა!</b>",
+        "shift_summary_orders": "<b>დღევანდელი მიტანები:</b> {n}",
+        "shift_summary_income": "<b>გამომუშავება:</b> {amount} ₾",
+        "shift_summary_tips": "<b>ჩაი:</b> {amount} ₾",
+        "shift_summary_total": "<b>სულ ცვლისთვის:</b> {amount} ₾",
+        "btn_stoplist": "სტოპ-ლისტი",
+        "stoplist_title": "<b>სტოპ-ლისტის მართვა</b>\nდააჭირეთ კერძს ხელმისაწვდომობის შესაცვლელად:",
+        "alert_dish_available": "🟢 «{name}» ახლა ხელმისაწვდომია მენიუში",
+        "alert_dish_stopped": "🔴 «{name}» დამატებულია სტოპ-ლისტში",
     },
 }
 
