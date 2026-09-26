@@ -4790,6 +4790,42 @@ body.modal-open {
 
   let currentLang = resolveLanguage();
 
+  // Inline strings for the three partner languages (ru / en / ka)
+  function tr(ru, en, ka) { return currentLang === 'ka' ? ka : currentLang === 'en' ? en : ru; }
+  // Money: whole numbers without decimals, otherwise two — "544 ₾", "3 480.50 ₾"
+  // What a courier earns for one delivery (server may send courier_fee / delivery_fee; 8 ₾ is the base rate)
+  function courierFee(o) { return Number(o && (o.courier_fee ?? o.delivery_fee)) || 8; }
+  // Customer-written text goes into innerHTML: escape it
+  function esc(v) {
+    return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  // The site stores the payment method as a "[Оплата: …]" tag inside the comment
+  function cleanComment(o) { return String(o?.comment || '').replace(/\[Оплата:[^\]]*\]/gi, '').trim(); }
+  function payMethod(o) {
+    const pm = String(o?.payment_method || '').toLowerCase();
+    if (pm) return pm === 'cash' ? 'cash' : 'online';
+    const c = String(o?.comment || '');
+    if (/\[Оплата:\s*Налич/i.test(c)) return 'cash';
+    if (/\[Оплата:/i.test(c)) return 'online';
+    return '';
+  }
+  function renderPayRow(o) {
+    const pm = payMethod(o);
+    if (!pm) return '';
+    const kitchen = isKitchenRole();
+    if (pm === 'cash') {
+      return kitchen
+        ? `<div class="pay-row is-cash">${iconSvg('wallet', '', 16)}<span>${tr('Клиент платит наличными курьеру', 'Customer pays the courier in cash', 'კლიენტი იხდის ნაღდით კურიერთან')}</span></div>`
+        : `<div class="pay-row is-cash">${iconSvg('wallet', '', 16)}<span>${tr('Наличные — взять с клиента', 'Cash — collect from customer', 'ნაღდი — აიღე კლიენტისგან')}</span><b>${money(o.total)}</b></div>`;
+    }
+    return `<div class="pay-row is-paid">${iconSvg('check', '', 16)}<span>${kitchen ? tr('Оплачено онлайн', 'Paid online', 'გადახდილია ონლაინ') : tr('Оплачено онлайн — деньги не брать', 'Paid online — collect nothing', 'გადახდილია ონლაინ — თანხას ნუ აიღებ')}</span></div>`;
+  }
+  function money(n) {
+    const v = Number(n) || 0;
+    const s = Math.abs(v % 1) < 0.005 ? v.toFixed(0) : v.toFixed(2);
+    return s.replace(/\B(?=(\d{3})+(?!\d))/g, '\u2009') + ' ₾';
+  }
+
   function t(key) {
     return I18N[currentLang]?.[key] || I18N.ru[key] || key;
   }
@@ -4962,7 +4998,7 @@ body.modal-open {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password })
         });
-        if (!res.ok) throw new Error('Неверный логин или пароль');
+        if (!res.ok) throw new Error(tr('Неверный логин или пароль', 'Wrong username or password', 'არასწორი ლოგინი ან პაროლი'));
       }
       const data = await res.json();
       const uObj = (data && typeof data.user === 'object' && data.user) ? data.user : data;
@@ -5089,7 +5125,23 @@ body.modal-open {
       }
     },
 
+    // Plans & awards set in the admin (Аналитика → Курьеры). GET /api/bot/v1/partner/kpi?courier_id=…
+    // → { plans: [{ title, metric, period, target, value, reward_gel }], awards: [{ amount, reason, created_at }] }
+    async fetchKpi() {
+      const courId = state.user?.courier_id || 0;
+      if (!courId || isKitchenRole()) return null;
+      try {
+        const res = await fetch(`/api/bot/v1/partner/kpi?courier_id=${encodeURIComponent(courId)}`, { headers: this.getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && (Array.isArray(data.plans) || Array.isArray(data.awards))) { state.courierKpi = data; return data; }
+        }
+      } catch (e) {}
+      return null;
+    },
+
     async fetchStats(period = 'week') {
+      this.fetchKpi().then((k) => { if (k && state.currentTab === 'stats') renderApp(); });
       const restId = state.user?.restaurant_id || '';
       const courId = state.user?.courier_id || 0;
       let url = `/api/bot/v1/partner/stats?period=${encodeURIComponent(period)}`;
@@ -5118,7 +5170,7 @@ body.modal-open {
       if (isNaN(d.getTime())) return '';
       const now = new Date();
       const sec = Math.floor((now - d) / 1000);
-      if (sec < 60) return currentLang === 'ka' ? 'ახლახან' : currentLang === 'en' ? 'just now' : 'только что';
+      if (sec < 60) return currentLang === 'ka' ? 'ახლახან' : currentLang === 'en' ? 'just now' : tr('только что', 'just now', 'ახლახან');
       const min = Math.floor(sec / 60);
       if (min < 60) return currentLang === 'ka' ? `${min} წთ უკან` : currentLang === 'en' ? `${min}m ago` : `${min} мин назад`;
       const hr = Math.floor(min / 60);
@@ -5229,10 +5281,10 @@ body.modal-open {
       navigator.clipboard.writeText(url).then(() => {
         showToast(t('details_link_copied'));
       }).catch(() => {
-        prompt('Ссылка на заказ:', url);
+        prompt(tr('Ссылка на заказ:', 'Order link:', 'შეკვეთის ბმული:'), url);
       });
     } else {
-      prompt('Ссылка на заказ:', url);
+      prompt(tr('Ссылка на заказ:', 'Order link:', 'შეკვეთის ბმული:'), url);
     }
   }
 
@@ -5274,18 +5326,20 @@ body.modal-open {
       }
     });
 
-    const avg = completedCount > 0 ? (revenue / completedCount).toFixed(1) : '0';
-    const courierEarnings = (completedCount * 8.0).toFixed(1);
+    const avg = completedCount > 0 ? revenue / completedCount : 0;
+    const doneOrders = state.orders.filter(o => o.status === 'delivered');
+    const courierEarnings = doneOrders.reduce((acc, o) => acc + courierFee(o), 0);
+    const courierTips = doneOrders.reduce((acc, o) => acc + (Number(o.tips) || 0), 0);
 
         let partnerTitle = isKitchen
-      ? (state.user?.restaurant_name || state.user?.name || 'Кухня')
-      : (state.user?.name || state.user?.username || 'Курьер');
+      ? (state.user?.restaurant_name || state.user?.name || tr('Кухня', 'Kitchen', 'სამზარეულო'))
+      : (state.user?.name || state.user?.username || tr('Курьер', 'Courier', 'კურიერი'));
 
     if (partnerTitle === 'test_rest' || partnerTitle === 'test_rest_01') {
-      partnerTitle = 'Тестовый Ресторан';
+      partnerTitle = tr('Тестовый Ресторан', 'Test restaurant', 'სატესტო რესტორანი');
     }
 
-    const partnerRole = isKitchen ? 'Кухня' : 'Курьер';
+    const partnerRole = isKitchen ? tr('Кухня', 'Kitchen', 'სამზარეულო') : tr('Курьер', 'Courier', 'კურიერი');
     const isModalOpen = Boolean(state.editingDish || state.isAddingDish);
     if (isModalOpen) {
       document.body.classList.add('modal-open');
@@ -5309,7 +5363,7 @@ body.modal-open {
               </div>
               <div class="header-brand-meta">
                 <span class="header-brand-title">${partnerTitle}</span>
-                <span class="header-brand-subtitle">Курьер • Доставка</span>
+                <span class="header-brand-subtitle">${tr('Курьер • Доставка', 'Courier • Delivery', 'კურიერი • მიტანა')}</span>
               </div>
             ` : `
               <div class="header-identity-box kitchen-mode">
@@ -5317,14 +5371,14 @@ body.modal-open {
               </div>
               <div class="header-brand-meta">
                 <span class="header-brand-title">${partnerTitle}</span>
-                <span class="header-brand-subtitle">Кухня • Терминал</span>
+                <span class="header-brand-subtitle">${tr('Кухня • Терминал', 'Kitchen • Terminal', 'სამზარეულო • ტერმინალი')}</span>
               </div>
             `}
           </div>
           <div class="header-actions">
             <button class="status-capsule-btn ${state.isOnline ? 'is-online' : 'is-offline'}" id="btn-shift">
               <span class="status-beacon-dot"></span>
-              <span class="status-text">${state.isOnline ? (isKitchen ? 'Открыто' : 'На смене') : (isKitchen ? 'Закрыто' : 'Не на смене')}</span>
+              <span class="status-text">${state.isOnline ? (isKitchen ? tr('Открыто', 'Open', 'ღიაა') : tr('На смене', 'On shift', 'ცვლაში')) : (isKitchen ? tr('Закрыто', 'Closed', 'დახურულია') : tr('Не на смене', 'Off shift', 'ცვლის გარეშე'))}</span>
             </button>
           </div>
         </header>
@@ -5334,7 +5388,7 @@ body.modal-open {
           <div class="metrics-strip">
             <div class="metric-col">
               <span class="metric-col-label">${isKitchen ? t('stat_revenue') : t('courier_kpi_earnings')}</span>
-              <span class="metric-col-val highlight">${isKitchen ? revenue.toFixed(1) + ' ₾' : courierEarnings + ' ₾'}</span>
+              <span class="metric-col-val highlight">${isKitchen ? money(revenue) : money(courierEarnings)}</span>
             </div>
             <div class="metric-col">
               <span class="metric-col-label">${isKitchen ? t('stat_count') : t('courier_kpi_deliveries')}</span>
@@ -5342,7 +5396,7 @@ body.modal-open {
             </div>
             <div class="metric-col">
               <span class="metric-col-label">${isKitchen ? t('stat_avg') : t('courier_kpi_tips')}</span>
-              <span class="metric-col-val">${isKitchen ? avg + ' ₾' : '0.0 ₾'}</span>
+              <span class="metric-col-val">${isKitchen ? money(avg) : money(courierTips)}</span>
             </div>
           </div>
         ` : ''}
@@ -5564,22 +5618,22 @@ body.modal-open {
                     <span class="item-qty-badge ${qty > 1 ? 'is-multi' : ''}">${qty}×</span>
                     <span class="item-title">${getTitle(it.name || it.title)}</span>
                   </div>
-                  <span class="item-cost">${((Number(it.price || 0)) * qty).toFixed(1)} ₾</span>
+                  <span class="item-cost">${money(Number(it.price || 0) * qty)}</span>
                 </div>
               `;}).join('')}
-              ${items.length > 3 ? `<div class="items-more-link" data-open-id="${id}">+ ещё ${items.length - 3} поз.</div>` : ''}
+              ${items.length > 3 ? `<div class="items-more-link" data-open-id="${id}">+ ${tr('ещё', 'more', 'კიდევ')} ${items.length - 3}</div>` : ''}
             </div>
           ` : ''}
 
-          ${order.comment ? `
+          ${cleanComment(order) ? `
             <div class="note-callout">
-              <strong>${t('note_prefix')}</strong> ${order.comment}
+              <strong>${t('note_prefix')}</strong> ${esc(cleanComment(order))}
             </div>
           ` : ''}
 
           <div class="card-summary">
             <span class="summary-label">${t('total_prefix')}</span>
-            <span class="total-amount">${total} ₾</span>
+            <span class="total-amount">${money(total)}</span>
           </div>
         ` : `
           <!-- Courier Vertical Route Stepper (Direct from Official Banner 5a) -->
@@ -5587,28 +5641,29 @@ body.modal-open {
             <div class="route-node">
               <div class="route-marker-circle"></div>
               <div class="route-node-content">
-                <span class="route-node-tag">PICK UP</span>
-                <span class="route-node-val">${order.restaurant_name || 'Ресторан MestiDelivery'}</span>
+                <span class="route-node-tag">${tr('ЗАБРАТЬ', 'PICK UP', 'აღება')}</span>
+                <span class="route-node-val">${order.restaurant_name || tr('Ресторан MestiDelivery', 'MestiDelivery restaurant', 'MestiDelivery რესტორანი')}</span>
               </div>
             </div>
             <div class="route-dash-connector"></div>
             <div class="route-node">
               <div class="route-marker-pin">${iconSvg("pin", "", 13)}</div>
               <div class="route-node-content">
-                <span class="route-node-tag">DROP OFF</span>
-                <span class="route-node-val">${order.address || 'Адрес клиента'}</span>
+                <span class="route-node-tag">${tr('ДОСТАВИТЬ', 'DROP OFF', 'მიტანა')}</span>
+                <span class="route-node-val">${order.address || tr('Адрес клиента', 'Customer address', 'კლიენტის მისამართი')}</span>
               </div>
             </div>
           </div>
 
           <div class="courier-payout-row">
-            <span class="payout-tag">ВЫПЛАТА КУРЬЕРУ</span>
-            <span class="payout-val">8.00 ₾</span>
+            <span class="payout-tag">${tr('ВЫПЛАТА КУРЬЕРУ', 'COURIER PAYOUT', 'კურიერის ანაზღაურება')}</span>
+            <span class="payout-val">${money(courierFee(order))}</span>
           </div>
+          ${renderPayRow(order)}
 
-          ${order.comment ? `
+          ${cleanComment(order) ? `
             <div class="note-callout">
-              <strong>${t('note_prefix')}</strong> ${order.comment}
+              <strong>${t('note_prefix')}</strong> ${esc(cleanComment(order))}
             </div>
           ` : ''}
         `}
@@ -5621,15 +5676,17 @@ body.modal-open {
   function renderActionBtn(orderId, status, isKitchen) {
     if (isKitchen) {
       if (status === 'new' || status === 'pending') {
+        // Accept is the main action; cancel is a compact icon button next to it (asks for confirmation)
         return `
-          <button class="btn-primary-action" data-btn-action="advance" data-id="${orderId}" data-target="confirmed">
-            ${iconSvg('check', '', 16)}
-            <span>${t('btn_accept')}</span>
-          </button>
-          <button class="btn-secondary-danger" data-btn-action="cancel" data-id="${orderId}">
-            ${iconSvg('cross', '', 14)}
-            <span>${t('btn_cancel')}</span>
-          </button>
+          <div class="action-pair">
+            <button class="btn-primary-action" data-btn-action="advance" data-id="${orderId}" data-target="confirmed">
+              ${iconSvg('check', '', 16)}
+              <span>${t('btn_accept')}</span>
+            </button>
+            <button class="btn-secondary-danger" data-btn-action="cancel" data-id="${orderId}" title="${t('btn_cancel')}" aria-label="${t('btn_cancel')}">
+              ${iconSvg('cross', '', 18)}
+            </button>
+          </div>
         `;
       }
       if (status === 'confirmed' || status === 'accepted') {
@@ -5711,8 +5768,8 @@ body.modal-open {
           </header>
           <div class="details-content">
             <div class="empty-wrap">
-              <div class="empty-headline">Заказ #${orderId} не найден</div>
-              <div class="empty-detail">Возможно, он был перемещен в архив или удален.</div>
+              <div class="empty-headline">${tr(`Заказ #${orderId} не найден`, `Order #${orderId} not found`, `შეკვეთა #${orderId} ვერ მოიძებნა`)}</div>
+              <div class="empty-detail">${tr('Возможно, он был перемещен в архив или удален.', 'It may have been archived or deleted.', 'შესაძლოა არქივშია ან წაშლილია.')}</div>
             </div>
           </div>
         </div>
@@ -5811,7 +5868,7 @@ body.modal-open {
               <div class="details-card-header">
                 <span class="details-card-title">${t('courier_assigned_title')}</span>
                 <span class="details-status-badge ${hasCourier ? 'is-assigned' : 'is-searching'}">
-                  ${hasCourier ? '<span class="status-tag-dot" style="background:var(--sky);"></span> Назначен' : '<span class="searching-pulse-dot"></span> Поиск'}
+                  ${hasCourier ? '<span class="status-tag-dot" style="background:var(--sky);"></span> ' + tr('Назначен', 'Assigned', 'დანიშნულია') : (status === 'new' || status === 'pending') ? tr('После принятия', 'After accepting', 'მიღების შემდეგ') : '<span class="searching-pulse-dot"></span> ' + tr('Поиск', 'Searching', 'ძებნა')}
                 </span>
               </div>
 
@@ -5820,8 +5877,8 @@ body.modal-open {
                   <div class="courier-details-left">
                     ${renderCourierAvatar(order.courier_photo, order.courier_name, 38)}
                     <div class="courier-details-info">
-                      <span class="courier-details-name">${order.courier_name || 'Курьер'}</span>
-                      <span class="courier-details-phone">${order.courier_phone || 'Телефон не указан'}</span>
+                      <span class="courier-details-name">${order.courier_name || tr('Курьер', 'Courier', 'კურიერი')}</span>
+                      <span class="courier-details-phone">${order.courier_phone || tr('Телефон не указан', 'No phone', 'ტელეფონი არ არის')}</span>
                     </div>
                   </div>
                   ${order.courier_phone ? `
@@ -5833,8 +5890,9 @@ body.modal-open {
                 </div>
               ` : `
                 <div class="courier-details-strip is-empty">
-                  <span class="searching-pulse-dot"></span>
-                  <span class="courier-search-text">${t('courier_searching')}</span>
+                  ${(status === 'new' || status === 'pending')
+                    ? `<span class="courier-search-text">${tr('Курьера назначим, как только вы примете заказ', 'A courier is assigned once you accept the order', 'კურიერი დაინიშნება შეკვეთის მიღებისთანავე')}</span>`
+                    : `<span class="searching-pulse-dot"></span><span class="courier-search-text">${t('courier_searching')}</span>`}
                 </div>
               `}
             </div>
@@ -5846,8 +5904,8 @@ body.modal-open {
               </div>
               <div class="client-row">
                 <div class="client-info">
-                  <span class="client-name">${order.customer_name || 'Клиент MestiDelivery'}</span>
-                  <span class="client-phone">${order.phone || 'Номер не указан'}</span>
+                  <span class="client-name">${order.customer_name || tr('Клиент MestiDelivery', 'MestiDelivery customer', 'MestiDelivery-ს კლიენტი')}</span>
+                  <span class="client-phone">${order.phone || tr('Номер не указан', 'No phone number', 'ნომერი არ არის')}</span>
                 </div>
                 ${order.phone ? `
                   <a class="client-call-btn" href="tel:${order.phone}">
@@ -5872,14 +5930,14 @@ body.modal-open {
                 <div class="route-row">
                   <span class="route-dot">${iconSvg("pin", "", 14)}</span>
                   <div class="route-body">
-                    <span class="route-type">Ресторан</span>
+                    <span class="route-type">${tr('Ресторан', 'Restaurant', 'რესტორანი')}</span>
                     <span class="route-name">${order.restaurant_name || 'MestiDelivery Restaurant'}</span>
                   </div>
                 </div>
                 <div class="route-row">
                   <span class="route-dot">${iconSvg("home", "", 14)}</span>
                   <div class="route-body">
-                    <span class="route-type">Адрес доставки</span>
+                    <span class="route-type">${tr('Адрес доставки', 'Delivery address', 'მიტანის მისამართი')}</span>
                     <span class="route-name">${order.address || 'Mestia, Georgia'}</span>
                   </div>
                 </div>
@@ -5888,13 +5946,13 @@ body.modal-open {
           `}
 
           <!-- 3. Customer Note (if present) -->
-          ${order.comment ? `
+          ${cleanComment(order) ? `
             <div class="details-card comment-card">
               <div class="details-card-header">
                 <span class="details-card-title">${t('order_notes_title')}</span>
               </div>
               <div class="note-callout" style="margin: 0; font-size: 13px; line-height: 1.5;">
-                <strong>${t('note_prefix')}</strong> ${order.comment}
+                <strong>${t('note_prefix')}</strong> ${esc(cleanComment(order))}
               </div>
             </div>
           ` : ''}
@@ -5903,7 +5961,7 @@ body.modal-open {
           <div class="details-card ticket-card">
             <div class="details-card-header">
               <span class="details-card-title">${t('ticket_title')}</span>
-              <span class="details-badge-muted">${items.length} поз.</span>
+              <span class="details-badge-muted">${items.length} ${tr('поз.', 'items', 'პოზ.')}</span>
             </div>
 
             <div class="items-table">
@@ -5915,7 +5973,7 @@ body.modal-open {
                       <span class="item-qty-badge ${qty > 1 ? 'is-multi' : ''}">${qty}×</span>
                       <span class="item-title">${getTitle(it.name || it.title)}</span>
                     </div>
-                    <span class="item-cost">${((Number(it.price || 0)) * qty).toFixed(1)} ₾</span>
+                    <span class="item-cost">${money(Number(it.price || 0) * qty)}</span>
                   </div>
                 `;
               }).join('')}
@@ -5924,18 +5982,19 @@ body.modal-open {
             <div class="order-totals-box">
               ${deliveryFee > 0 ? `
                 <div class="totals-line">
-                  <span class="totals-label">Сумма блюд:</span>
-                  <span class="totals-val">${subtotal.toFixed(2)} ₾</span>
+                  <span class="totals-label">${tr('Сумма блюд:', 'Items:', 'კერძები:')}</span>
+                  <span class="totals-val">${money(subtotal)}</span>
                 </div>
                 <div class="totals-line">
-                  <span class="totals-label">Доставка:</span>
-                  <span class="totals-val">${deliveryFee.toFixed(2)} ₾</span>
+                  <span class="totals-label">${tr('Доставка:', 'Delivery:', 'მიტანა:')}</span>
+                  <span class="totals-val">${money(deliveryFee)}</span>
                 </div>
               ` : ''}
               <div class="totals-line totals-main">
-                <span class="totals-main-label">Итого:</span>
-                <span class="totals-main-val">${total} ₾</span>
+                <span class="totals-main-label">${tr('Итого:', 'Total:', 'სულ:')}</span>
+                <span class="totals-main-val">${money(total)}</span>
               </div>
+              ${renderPayRow(order)}
             </div>
           </div>
 
@@ -6011,7 +6070,7 @@ body.modal-open {
     // Categories array with counts
     const catCounts = {};
     (state.dishes || []).forEach(d => {
-      const c = d.category || 'Общее';
+      const c = d.category || tr('Общее', 'General', 'ზოგადი');
       catCounts[c] = (catCounts[c] || 0) + 1;
     });
     const stoppedCount = (state.dishes || []).filter(d => !d.is_available).length;
@@ -6031,7 +6090,7 @@ body.modal-open {
         </div>
         <button class="btn-add-dish-primary" id="btn-open-add-dish">
           ${iconSvg("plus", "", 15)}
-          <span>Добавить</span>
+          <span>${tr('Добавить', 'Add', 'დამატება')}</span>
         </button>
       </div>
 
@@ -6064,7 +6123,7 @@ body.modal-open {
         ${list.length === 0 ? `
           <div class="empty-wrap">
             <div class="empty-headline">${t('empty_menu')}</div>
-            <div class="empty-detail">Попробуйте выбрать другую категорию или добавить новое блюдо.</div>
+            <div class="empty-detail">${tr('Попробуйте выбрать другую категорию или добавить новое блюдо.', 'Try another category or add a new dish.', 'სცადე სხვა კატეგორია ან დაამატე ახალი კერძი.')}</div>
           </div>
         ` : list.map(d => renderDishCard(d)).join('')}
       </div>
@@ -6092,7 +6151,7 @@ body.modal-open {
         <div class="dish-body-rich">
           <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;">
             <div class="dish-title-rich">${title}</div>
-            <div class="dish-price-rich">${price} ₾</div>
+            <div class="dish-price-rich">${money(price)}</div>
           </div>
 
           <div class="dish-tags-row">
@@ -6112,9 +6171,9 @@ body.modal-open {
 
             <div style="display: flex; align-items: center; gap: 8px;">
               <span style="font-size: 11px; color: ${isAvail ? 'var(--emerald)' : 'var(--crimson)'}; font-weight: 700;">
-                ${isAvail ? 'В наличии' : 'Стоп-лист'}
+                ${isAvail ? tr('В наличии', 'In stock', 'მარაგშია') : tr('Стоп-лист', 'Stop list', 'სტოპ-ლისტი')}
               </span>
-              <label class="switch" title="В наличии / Стоп-лист">
+              <label class="switch" title="${tr('В наличии / Стоп-лист', 'In stock / Stop list', 'მარაგშია / სტოპ-ლისტი')}">
                 <input type="checkbox" class="dish-toggle-switch" data-dish-id="${dish.id}" ${isAvail ? 'checked' : ''} />
                 <span class="slider"></span>
               </label>
@@ -6143,6 +6202,29 @@ body.modal-open {
     const maxChartVal = chartList.reduce((acc, p) => Math.max(acc, Number(p.revenue || p.amount || 0)), 1);
     const restShare = s.restaurant_net || (s.revenue ? (Number(s.revenue) * 0.9) : 0);
     const platFee = s.platform_fee || (s.revenue ? (Number(s.revenue) * 0.1) : 0);
+    // Commission % comes from the numbers (it is set per restaurant in the admin), not from a fixed label
+    const feePct = Number(s.revenue) > 0 ? Math.round((Number(platFee) / Number(s.revenue)) * 1000) / 10 : 10;
+    const withPct = (label, pct) => String(label).replace(/\(\s*\d+([.,]\d+)?\s*%\s*\)/, `(${pct}%)`);
+
+    // Best sellers: from the server if it sends them, otherwise counted from this period's delivered orders
+    const topDishes = (s.top_dishes && s.top_dishes.length) ? s.top_dishes : (() => {
+      const days = { today: 1, week: 7, month: 31 }[state.statsPeriod] || 36500;
+      const from = state.statsPeriod === 'today' ? new Date(new Date().setHours(0, 0, 0, 0)).getTime() : Date.now() - days * 864e5;
+      const map = {};
+      state.orders.filter(o => o.status === 'delivered' && new Date(o.created_at).getTime() >= from).forEach(o => {
+        let items = o.items || o.items_json || [];
+        if (typeof items === 'string') { try { items = JSON.parse(items); } catch (e) { items = []; } }
+        (Array.isArray(items) ? items : []).forEach(it => {
+          const name = getTitle(it.name || it.title || '');
+          if (!name) return;
+          const q = Number(it.quantity || 1);
+          map[name] = map[name] || { name, count: 0, revenue: 0 };
+          map[name].count += q;
+          map[name].revenue += q * Number(it.price || 0);
+        });
+      });
+      return Object.values(map).sort((a, b) => b.count - a.count).slice(0, 5);
+    })();
 
     return `
       <div class="stats-container">
@@ -6158,23 +6240,23 @@ body.modal-open {
         <div class="kpi-grid">
           <div class="kpi-card highlight">
             <span class="kpi-label">${t('kpi_revenue')}</span>
-            <span class="kpi-num emerald">${Number(s.revenue || 0).toFixed(1)} ₾</span>
-            <span class="kpi-sub">За выбранный период</span>
+            <span class="kpi-num emerald">${money(Number(s.revenue || 0))}</span>
+            <span class="kpi-sub">${tr('За выбранный период', 'For the selected period', 'არჩეულ პერიოდში')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('kpi_delivered')}</span>
             <span class="kpi-num">${s.delivered_count || 0}</span>
-            <span class="kpi-sub">Успешно доставлено</span>
+            <span class="kpi-sub">${tr('Успешно доставлено', 'Delivered', 'მიტანილია')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('kpi_active')}</span>
             <span class="kpi-num" style="color: var(--amber);">${s.active_count || 0}</span>
-            <span class="kpi-sub">Сейчас на кухне</span>
+            <span class="kpi-sub">${tr('Сейчас на кухне', 'In the kitchen now', 'ახლა სამზარეულოშია')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('kpi_avg_check')}</span>
-            <span class="kpi-num">${Number(s.avg_check || 0).toFixed(1)} ₾</span>
-            <span class="kpi-sub">Средний чек заказа</span>
+            <span class="kpi-num">${money(Number(s.avg_check || 0))}</span>
+            <span class="kpi-sub">${tr('Средний чек заказа', 'Average order', 'საშუალო შეკვეთა')}</span>
           </div>
         </div>
 
@@ -6183,9 +6265,9 @@ body.modal-open {
           <div class="chart-head">
             <div>
               <div class="chart-title">${t('chart_sales_dynamic')}</div>
-              <div style="font-size: 11px; color: var(--text-muted);">Выручка по дням (₾)</div>
+              <div style="font-size: 11px; color: var(--text-muted);">${tr('Выручка по дням (₾)', 'Revenue by day (₾)', 'შემოსავალი დღეების მიხედვით (₾)')}</div>
             </div>
-            <span class="chart-sum">${Number(s.revenue || 0).toFixed(1)} ₾</span>
+            <span class="chart-sum">${money(Number(s.revenue || 0))}</span>
           </div>
 
           <div class="chart-bars-wrap">
@@ -6211,23 +6293,23 @@ body.modal-open {
         <div class="top-dishes-card">
           <div class="chart-head">
             <span class="chart-title">${t('top_dishes_title')}</span>
-            <span style="font-size: 11px; color: var(--emerald); font-weight: 800; background: var(--emerald-dim); padding: 2px 8px; border-radius: 6px;">ТОП ПОЗИЦИИ</span>
+            <span style="font-size: 11px; color: var(--emerald); font-weight: 800; background: var(--emerald-dim); padding: 2px 8px; border-radius: 6px;">${tr('ТОП ПОЗИЦИИ', 'TOP ITEMS', 'ტოპ პოზიციები')}</span>
           </div>
 
-          ${(s.top_dishes && s.top_dishes.length > 0) ? s.top_dishes.map((td, i) => `
+          ${topDishes.length > 0 ? topDishes.map((td, i) => `
             <div class="top-dish-row">
               <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
                 <div class="top-rank-circle ${i === 0 ? 'gold' : ''}">${i + 1}</div>
                 <div style="min-width: 0;">
                   <div class="top-dish-name">${td.name}</div>
-                  <div class="top-dish-qty">${td.count} заказов</div>
+                  <div class="top-dish-qty">${td.count} ${tr('шт', 'pcs', 'ც')}</div>
                 </div>
               </div>
-              <div class="top-dish-money">${Number(td.revenue || 0).toFixed(1)} ₾</div>
+              <div class="top-dish-money">${money(Number(td.revenue || 0))}</div>
             </div>
           `).join('') : `
             <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 14px 0;">
-              Данные по лидерам продаж формируются по мере выполнения заказов.
+              ${tr('Лидеры продаж появятся по мере выполнения заказов.', 'Best sellers will appear as orders are completed.', 'ლიდერები გამოჩნდება შეკვეთების შესრულებისას.')}
             </div>
           `}
         </div>
@@ -6242,20 +6324,53 @@ body.modal-open {
           </div>
 
           <div class="settlement-row">
-            <span>Общая сумма продаж:</span>
-            <span style="font-weight: 800; color: var(--text-primary); font-size: 15px;">${Number(s.revenue || 0).toFixed(2)} ₾</span>
+            <span>${tr('Общая сумма продаж:', 'Total sales:', 'გაყიდვები სულ:')}</span>
+            <span style="font-weight: 800; color: var(--text-primary); font-size: 15px;">${money(Number(s.revenue || 0))}</span>
           </div>
           <div class="settlement-row">
-            <span>${t('payout_platform_fee')}:</span>
-            <span style="color: var(--text-muted);">${Number(platFee).toFixed(2)} ₾</span>
+            <span>${withPct(t('payout_platform_fee'), feePct)}:</span>
+            <span style="color: var(--text-muted);">${money(Number(platFee))}</span>
           </div>
           <div class="settlement-row total">
-            <span>${t('payout_rest_share')}:</span>
-            <span style="color: var(--emerald); font-size: 18px; font-weight: 900;">${Number(restShare).toFixed(2)} ₾</span>
+            <span>${withPct(t('payout_rest_share'), Math.round((100 - feePct) * 10) / 10)}:</span>
+            <span style="color: var(--emerald); font-size: 18px; font-weight: 900;">${money(Number(restShare))}</span>
           </div>
         </div>
       </div>
     `;
+  }
+
+  function renderCourierGoals() {
+    const k = state.courierKpi;
+    if (!k || (!(k.plans || []).length && !(k.awards || []).length)) return '';
+    const unit = (m) => m === 'revenue' ? '₾' : tr('доставок', 'deliveries', 'მიტანა');
+    return `
+      <div class="goals-card">
+        <div class="chart-head">
+          <span class="chart-title">${tr('Цели и премии', 'Goals & bonuses', 'მიზნები და პრემიები')}</span>
+        </div>
+        ${(k.plans || []).map(p => {
+          const pct = p.target ? Math.min(100, Math.round((Number(p.value || 0) / Number(p.target)) * 100)) : 0;
+          const done = pct >= 100;
+          return `
+            <div class="goal-row ${done ? 'is-done' : ''}">
+              <div class="goal-top">
+                <span class="goal-title">${esc(p.title)}</span>
+                <span class="goal-reward">+${money(p.reward_gel)}</span>
+              </div>
+              <div class="goal-bar"><i style="width:${pct}%"></i></div>
+              <div class="goal-meta">
+                ${p.metric === 'revenue' ? money(p.value) : Number(p.value || 0)} / ${p.metric === 'revenue' ? money(p.target) : `${p.target} ${unit(p.metric)}`}
+                · ${done ? tr('План выполнен!', 'Goal reached!', 'გეგმა შესრულდა!') : (p.period === 'week' ? tr('за неделю', 'this week', 'ამ კვირაში') : tr('за месяц', 'this month', 'ამ თვეში'))}
+              </div>
+            </div>`;
+        }).join('')}
+        ${(k.awards || []).slice(0, 3).map(a => `
+          <div class="award-row">
+            <span>${iconSvg('check', '', 14)} ${esc(a.reason)}</span>
+            <b>+${money(a.amount)}</b>
+          </div>`).join('')}
+      </div>`;
   }
 
   function renderCourierStatsTab() {
@@ -6264,11 +6379,11 @@ body.modal-open {
     let earnedFees = 0;
     let tipsTotal = 0;
     deliveredOrders.forEach(o => {
-      earnedFees += (Number(o.delivery_fee) || 8.0);
+      earnedFees += courierFee(o);
       tipsTotal += (Number(o.tips) || 0.0);
     });
     const totalEarnings = earnedFees + tipsTotal;
-    const avgDeliveryFee = totalDeliveries > 0 ? (totalEarnings / totalDeliveries).toFixed(1) : '8.0';
+    const avgDeliveryFee = totalDeliveries > 0 ? totalEarnings / totalDeliveries : 8;
 
     // Group deliveries by day for the chart
     const daysMap = {};
@@ -6276,7 +6391,7 @@ body.modal-open {
     for (let i = 6; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 86400000);
       const dayKey = d.toISOString().slice(5, 10).replace('-', '.');
-      const dayNames = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+      const dayNames = currentLang === 'ka' ? ['კვ', 'ორ', 'სა', 'ოთ', 'ხუ', 'პა', 'შა'] : currentLang === 'en' ? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] : ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
       const dayName = dayNames[d.getDay()];
       daysMap[dayKey] = { label: `${dayName} ${dayKey}`, count: 0, earnings: 0 };
     }
@@ -6286,7 +6401,7 @@ body.modal-open {
         const dKey = o.created_at.slice(5, 10).replace('-', '.');
         if (daysMap[dKey]) {
           daysMap[dKey].count += 1;
-          daysMap[dKey].earnings += (Number(o.delivery_fee) || 8.0);
+          daysMap[dKey].earnings += courierFee(o);
         }
       }
     });
@@ -6308,34 +6423,36 @@ body.modal-open {
         <div class="kpi-grid">
           <div class="kpi-card highlight">
             <span class="kpi-label">${t('courier_kpi_earnings')}</span>
-            <span class="kpi-num emerald">${totalEarnings.toFixed(1)} ₾</span>
-            <span class="kpi-sub">За период (+доставки и чаевые)</span>
+            <span class="kpi-num emerald">${money(totalEarnings)}</span>
+            <span class="kpi-sub">${tr('За период (+доставки и чаевые)', 'For the period (deliveries + tips)', 'პერიოდში (მიტანა + ჩაი)')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('courier_kpi_deliveries')}</span>
             <span class="kpi-num">${totalDeliveries}</span>
-            <span class="kpi-sub">Успешно вручено клиентам</span>
+            <span class="kpi-sub">${tr('Успешно вручено клиентам', 'Handed to customers', 'გადაეცა კლიენტებს')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('courier_kpi_tips')}</span>
-            <span class="kpi-num" style="color: var(--amber);">${tipsTotal.toFixed(1)} ₾</span>
-            <span class="kpi-sub">Чаевые от клиентов</span>
+            <span class="kpi-num" style="color: var(--amber);">${money(tipsTotal)}</span>
+            <span class="kpi-sub">${tr('Чаевые от клиентов', 'Tips from customers', 'ჩაი კლიენტებისგან')}</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-label">${t('courier_kpi_avg')}</span>
-            <span class="kpi-num">${avgDeliveryFee} ₾</span>
-            <span class="kpi-sub">Средний доход за рейс</span>
+            <span class="kpi-num">${money(avgDeliveryFee)}</span>
+            <span class="kpi-sub">${tr('Средний доход за рейс', 'Average per trip', 'საშუალო რეისზე')}</span>
           </div>
         </div>
+
+        ${renderCourierGoals()}
 
         <!-- Courier Delivery Trips Chart -->
         <div class="chart-card">
           <div class="chart-head">
             <div>
               <div class="chart-title">${t('courier_chart_title')}</div>
-              <div style="font-size: 11px; color: var(--text-muted);">Количество выполненных доставок по дням</div>
+              <div style="font-size: 11px; color: var(--text-muted);">${tr('Количество выполненных доставок по дням', 'Completed deliveries by day', 'შესრულებული მიტანები დღეების მიხედვით')}</div>
             </div>
-            <span class="chart-sum">${totalDeliveries} рейсов</span>
+            <span class="chart-sum">${totalDeliveries} ${tr('рейсов', 'trips', 'რეისი')}</span>
           </div>
 
           <div class="chart-bars-wrap">
@@ -6359,24 +6476,24 @@ body.modal-open {
         <div class="top-dishes-card">
           <div class="chart-head">
             <span class="chart-title">${t('courier_trips_title')}</span>
-            <span style="font-size: 11px; color: var(--sky); font-weight: 800; background: var(--sky-dim); padding: 2px 8px; border-radius: 6px;">РЕЙСЫ</span>
+            <span style="font-size: 11px; color: var(--sky); font-weight: 800; background: var(--sky-dim); padding: 2px 8px; border-radius: 6px;">${tr('РЕЙСЫ', 'TRIPS', 'რეისები')}</span>
           </div>
 
           ${deliveredOrders.length > 0 ? `
             <div class="courier-trips-list">
               ${deliveredOrders.slice(0, 10).map(o => {
                 const oid = Number(o.id || o.order_id);
-                const fee = (Number(o.delivery_fee) || 8.0).toFixed(2);
+                const fee = courierFee(o);
                 const time = formatElapsed(o.created_at);
                 return `
                   <div class="courier-trip-item">
                     <div class="courier-trip-route">
-                      <div class="courier-trip-id">Заказ #${oid} • <span style="font-size: 11px; color: var(--emerald); font-weight: 700;">Вручен</span></div>
-                      <div class="courier-trip-path">${iconSvg("pin", "", 12)} ${o.restaurant_name || 'Заведение'} ${iconSvg("arrowRight", "", 12)} ${iconSvg("home", "", 12)} ${o.address || 'Местия'}</div>
+                      <div class="courier-trip-id">${tr("Заказ", "Order", "შეკვეთა")} #${oid} • <span style="font-size: 11px; color: var(--emerald); font-weight: 700;">${tr('Вручен', 'Delivered', 'გადაცემულია')}</span></div>
+                      <div class="courier-trip-path">${iconSvg("pin", "", 12)} ${o.restaurant_name || tr('Заведение', 'Restaurant', 'დაწესებულება')} ${iconSvg("arrowRight", "", 12)} ${iconSvg("home", "", 12)} ${o.address || 'Местия'}</div>
                       <div style="font-size: 10px; color: var(--text-muted);">${time}</div>
                     </div>
                     <div class="courier-trip-payout">
-                      +${fee} ₾
+                      +${money(fee)}
                     </div>
                   </div>
                 `;
@@ -6384,7 +6501,7 @@ body.modal-open {
             </div>
           ` : `
             <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 20px 0;">
-              Выполненные рейсы будут отображаться здесь после вручения клиентам.
+              ${tr('Выполненные рейсы появятся здесь после вручения клиентам.', 'Completed trips will appear here once delivered.', 'შესრულებული რეისები აქ გამოჩნდება მიტანის შემდეგ.')}
             </div>
           `}
         </div>
@@ -6399,16 +6516,16 @@ body.modal-open {
           </div>
 
           <div class="settlement-row">
-            <span>Доход за доставку:</span>
-            <span style="font-weight: 800; color: var(--text-primary); font-size: 15px;">${earnedFees.toFixed(2)} ₾</span>
+            <span>${tr('Доход за доставку:', 'Delivery earnings:', 'შემოსავალი მიტანიდან:')}</span>
+            <span style="font-weight: 800; color: var(--text-primary); font-size: 15px;">${money(earnedFees)}</span>
           </div>
           <div class="settlement-row">
-            <span>Чаевые от клиентов:</span>
-            <span style="color: var(--amber); font-weight: 700;">+${tipsTotal.toFixed(2)} ₾</span>
+            <span>${tr('Чаевые от клиентов:', 'Tips from customers:', 'ჩაი კლიენტებისგან:')}</span>
+            <span style="color: var(--amber); font-weight: 700;">+${money(tipsTotal)}</span>
           </div>
           <div class="settlement-row total">
-            <span>Итого к выплате:</span>
-            <span style="color: var(--emerald); font-size: 18px; font-weight: 900;">${totalEarnings.toFixed(2)} ₾</span>
+            <span>${tr('Итого к выплате:', 'Total payout:', 'სულ გასაცემი:')}</span>
+            <span style="color: var(--emerald); font-size: 18px; font-weight: 900;">${money(totalEarnings)}</span>
           </div>
 
           <button class="btn-primary-action" id="btn-courier-withdraw" style="margin-top: 14px; height: 44px; font-size: 13px;">
@@ -6447,14 +6564,14 @@ body.modal-open {
               <input type="number" step="0.5" id="inp-edit-price" class="input-field" value="${dish.price || 0}" />
             </div>
             <div class="modal-form-group">
-              <label class="modal-label">Граммовка</label>
-              <input type="text" id="inp-edit-weight" class="input-field" value="${dish.weight || ''}" placeholder="250 г" />
+              <label class="modal-label">${tr('Граммовка', 'Weight', 'წონა')}</label>
+              <input type="text" id="inp-edit-weight" class="input-field" value="${dish.weight || ''}" placeholder="${tr('250 г', '250 g', '250 გ')}" />
             </div>
           </div>
 
           <div class="modal-form-group">
             <label class="modal-label">${t('field_category')}</label>
-            <input type="text" id="inp-edit-category" class="input-field" value="${dish.category || ''}" placeholder="Пицца / Бургеры" />
+            <input type="text" id="inp-edit-category" class="input-field" value="${dish.category || ''}" placeholder="${tr('Пицца / Бургеры', 'Pizza / Burgers', 'პიცა / ბურგერები')}" />
           </div>
 
           <div class="modal-form-group">
@@ -6496,7 +6613,7 @@ body.modal-open {
 
           <div class="modal-form-group">
             <label class="modal-label">${t('field_name')} *</label>
-            <input type="text" id="inp-add-name" class="input-field" placeholder="Например: Хачапури по-аджарски" />
+            <input type="text" id="inp-add-name" class="input-field" placeholder="${tr('Например: Хачапури по-аджарски', 'e.g. Adjarian khachapuri', 'მაგ: აჭარული ხაჭაპური')}" />
           </div>
 
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -6505,19 +6622,19 @@ body.modal-open {
               <input type="number" step="0.5" id="inp-add-price" class="input-field" placeholder="18.0" />
             </div>
             <div class="modal-form-group">
-              <label class="modal-label">Граммовка</label>
-              <input type="text" id="inp-add-weight" class="input-field" placeholder="350 г" />
+              <label class="modal-label">${tr('Граммовка', 'Weight', 'წონა')}</label>
+              <input type="text" id="inp-add-weight" class="input-field" placeholder="${tr('350 г', '350 g', '350 გ')}" />
             </div>
           </div>
 
           <div class="modal-form-group">
             <label class="modal-label">${t('field_category')}</label>
-            <input type="text" id="inp-add-category" class="input-field" placeholder="Пицца / Бургеры / Выпечка" />
+            <input type="text" id="inp-add-category" class="input-field" placeholder="${tr('Пицца / Бургеры / Выпечка', 'Pizza / Burgers / Bakery', 'პიცა / ბურგერები / ცომეული')}" />
           </div>
 
           <div class="modal-form-group">
             <label class="modal-label">${t('field_description')}</label>
-            <textarea id="inp-add-desc" class="modal-textarea" placeholder="Состав, особенности приготовления..."></textarea>
+            <textarea id="inp-add-desc" class="modal-textarea" placeholder="${tr('Состав, особенности приготовления…', 'Ingredients, how it is cooked…', 'შემადგენლობა, მომზადების თავისებურებები…')}"></textarea>
           </div>
 
           <div class="modal-actions-row">
@@ -6545,17 +6662,17 @@ body.modal-open {
           <div class="settings-group-header">${t('prep_time_title')}</div>
           <div class="settings-card" style="padding: 10px 12px;">
             <div class="segmented-control">
-              <button class="segment-btn ${state.prepTime === '15' ? 'is-active' : ''}" data-prep="15">15 мин</button>
-              <button class="segment-btn ${state.prepTime === '25' ? 'is-active' : ''}" data-prep="25">25 мин</button>
-              <button class="segment-btn ${state.prepTime === '40' ? 'is-active' : ''}" data-prep="40">40 мин</button>
-              <button class="segment-btn ${state.prepTime === '60' ? 'is-active' : ''}" data-prep="60">60 мин</button>
+              <button class="segment-btn ${state.prepTime === '15' ? 'is-active' : ''}" data-prep="15">15 ${tr('мин', 'min', 'წთ')}</button>
+              <button class="segment-btn ${state.prepTime === '25' ? 'is-active' : ''}" data-prep="25">25 ${tr('мин', 'min', 'წთ')}</button>
+              <button class="segment-btn ${state.prepTime === '40' ? 'is-active' : ''}" data-prep="40">40 ${tr('мин', 'min', 'წთ')}</button>
+              <button class="segment-btn ${state.prepTime === '60' ? 'is-active' : ''}" data-prep="60">60 ${tr('мин', 'min', 'წთ')}</button>
             </div>
           </div>
         </div>
 
         <!-- Group: Automation & Alerts -->
         <div class="settings-group">
-          <div class="settings-group-header">ОПОВЕЩЕНИЯ И АВТОМАТИЗАЦИЯ</div>
+          <div class="settings-group-header">${tr('ОПОВЕЩЕНИЯ И АВТОМАТИЗАЦИЯ', 'NOTIFICATIONS & AUTOMATION', 'შეტყობინებები და ავტომატიზაცია')}</div>
           <div class="settings-card">
             <div class="settings-row">
               <div class="profile-toggle-info">
@@ -6571,7 +6688,7 @@ body.modal-open {
             <div class="settings-row">
               <div class="profile-toggle-info">
                 <span class="profile-toggle-title">${t('sound_label')}</span>
-                <span class="profile-toggle-sub">Громкий сигнал при поступлении заказа</span>
+                <span class="profile-toggle-sub">${tr('Громкий сигнал при поступлении заказа', 'Loud sound when an order arrives', 'ხმოვანი სიგნალი ახალ შეკვეთაზე')}</span>
               </div>
               <label class="switch">
                 <input type="checkbox" id="chk-sound-enabled" ${state.soundEnabled ? 'checked' : ''} />
@@ -6583,19 +6700,19 @@ body.modal-open {
 
         <!-- Group: Support & Regulations -->
         <div class="settings-group">
-          <div class="settings-group-header">СВЯЗЬ И ПОДДЕРЖКА</div>
+          <div class="settings-group-header">${tr('СВЯЗЬ И ПОДДЕРЖКА', 'CONTACT & SUPPORT', 'კავშირი და მხარდაჭერა')}</div>
           <div class="settings-card">
             <div class="settings-row" style="cursor: pointer;" onclick="window.open('https://t.me/MestiDelivery_Support', '_blank')">
               <div style="display: flex; align-items: center; gap: 12px;">
                 <div style="color: var(--brand);">${iconSvg("headset", "", 17)}</div>
-                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">Диспетчер MestiDelivery</div>
+                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">${tr('Диспетчер MestiDelivery', 'MestiDelivery dispatcher', 'MestiDelivery-ს დისპეჩერი')}</div>
               </div>
               <div style="color: var(--text-muted);">${iconSvg("arrowRight", "", 14)}</div>
             </div>
             <div class="settings-row" style="cursor: pointer;" onclick="window.open('tel:+995595000000')">
               <div style="display: flex; align-items: center; gap: 12px;">
                 <div style="color: var(--brand);">${iconSvg("phone", "", 17)}</div>
-                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">Горячая линия</div>
+                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">${tr('Горячая линия', 'Hotline', 'ცხელი ხაზი')}</div>
               </div>
               <div style="color: var(--text-muted);">${iconSvg("arrowRight", "", 14)}</div>
             </div>
@@ -6608,7 +6725,7 @@ body.modal-open {
   }
 
   function renderCourierProfileTab() {
-    const courierName = state.user?.name || state.user?.username || 'Курьер';
+    const courierName = state.user?.name || state.user?.username || tr('Курьер', 'Courier', 'კურიერი');
     const transport = state.courierTransport || 'bike';
     const username = state.user?.username || 'courier';
     const courierId = state.user?.courier_id || state.user?.id || 2;
@@ -6620,22 +6737,22 @@ body.modal-open {
           <div class="settings-group-header">${t('courier_transport_title')}</div>
           <div class="settings-card" style="padding: 10px 12px;">
             <div class="segmented-control">
-              <button class="segment-btn ${transport === 'foot' ? 'is-active' : ''}" data-transport="foot">Пеший</button>
-              <button class="segment-btn ${transport === 'bike' ? 'is-active' : ''}" data-transport="bike">Вело</button>
-              <button class="segment-btn ${transport === 'scooter' ? 'is-active' : ''}" data-transport="scooter">Скутер</button>
-              <button class="segment-btn ${transport === 'car' ? 'is-active' : ''}" data-transport="car">Авто</button>
+              <button class="segment-btn ${transport === 'foot' ? 'is-active' : ''}" data-transport="foot">${tr('Пеший', 'Walk', 'ფეხით')}</button>
+              <button class="segment-btn ${transport === 'bike' ? 'is-active' : ''}" data-transport="bike">${tr('Вело', 'Bike', 'ველო')}</button>
+              <button class="segment-btn ${transport === 'scooter' ? 'is-active' : ''}" data-transport="scooter">${tr('Скутер', 'Scooter', 'სკუტერი')}</button>
+              <button class="segment-btn ${transport === 'car' ? 'is-active' : ''}" data-transport="car">${tr('Авто', 'Car', 'მანქანა')}</button>
             </div>
           </div>
         </div>
 
         <!-- Group: Signals & Feedback -->
         <div class="settings-group">
-          <div class="settings-group-header">Оповещения и сигналы</div>
+          <div class="settings-group-header">${tr('Оповещения и сигналы', 'Notifications & sounds', 'შეტყობინებები და ხმები')}</div>
           <div class="settings-card">
             <div class="settings-row">
               <div class="profile-toggle-info">
                 <span class="profile-toggle-title">${t('sound_label')}</span>
-                <span class="profile-toggle-sub">Громкий сигнал при назначении заказа</span>
+                <span class="profile-toggle-sub">${tr('Громкий сигнал при назначении заказа', 'Loud sound when an order is assigned', 'ხმოვანი სიგნალი შეკვეთის მინიჭებისას')}</span>
 
               </div>
               <label class="switch">
@@ -6659,19 +6776,19 @@ body.modal-open {
 
         <!-- Group: Support & Regulations -->
         <div class="settings-group">
-          <div class="settings-group-header">Поддержка курьеров</div>
+          <div class="settings-group-header">${tr('Поддержка курьеров', 'Courier support', 'კურიერების მხარდაჭერა')}</div>
           <div class="settings-card">
             <div class="settings-row" style="cursor: pointer;" onclick="window.open('https://t.me/MestiDelivery_Support', '_blank')">
               <div style="display: flex; align-items: center; gap: 10px;">
                 <div style="color: var(--brand);">${iconSvg("headset", "", 18)}</div>
-                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">Диспетчер смены Telegram</div>
+                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">${tr('Диспетчер смены Telegram', 'Shift dispatcher (Telegram)', 'ცვლის დისპეჩერი (Telegram)')}</div>
               </div>
               <div style="color: var(--text-muted);">${iconSvg("arrowRight", "", 14)}</div>
             </div>
             <div class="settings-row" style="cursor: pointer;" onclick="window.open('tel:+995595000000')">
               <div style="display: flex; align-items: center; gap: 10px;">
                 <div style="color: var(--crimson);">${iconSvg("alert", "", 18)}</div>
-                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">Форс-мажор в пути (Срочно)</div>
+                <div style="font-size: 13.5px; font-weight: 600; color: #FFF;">${tr('Форс-мажор в пути (Срочно)', 'Emergency on the way (urgent)', 'ფორს-მაჟორი გზაში (სასწრაფო)')}</div>
               </div>
               <div style="color: var(--text-muted);">${iconSvg("arrowRight", "", 14)}</div>
             </div>
@@ -6685,7 +6802,7 @@ body.modal-open {
   function renderSystemCard() {
     return `
       <div class="settings-group">
-        <div class="settings-group-header">ЯЗЫК ИНТЕРФЕЙСА</div>
+        <div class="settings-group-header">${tr('ЯЗЫК ИНТЕРФЕЙСА', 'INTERFACE LANGUAGE', 'ინტერფეისის ენა')}</div>
         <div class="settings-card" style="padding: 10px 12px;">
           <div class="segmented-control">
             <button class="segment-btn ${currentLang === 'ru' ? 'is-active' : ''}" data-set-lang="ru">Русский</button>
@@ -6704,7 +6821,7 @@ body.modal-open {
           <span>${t('logout')}</span>
         </button>
         <div class="app-version-footnote">
-          MestiDelivery Partners • v8.1
+          MestiDelivery Partners • v8.2
         </div>
       </div>
     `;
@@ -6727,7 +6844,7 @@ body.modal-open {
             ${t('not_reg_title')}
           </div>
           <div style="font-size: 13px; color: var(--text-secondary); line-height: 1.5;">
-            ${name ? `Привет, ${name}! ` : ''}${t('not_reg_sub')}
+            ${name ? `${tr('Привет', 'Hi', 'გამარჯობა')}, ${name}! ` : ''}${t('not_reg_sub')}
           </div>
           <a class="btn-primary-action" href="https://t.me/MestiDelivery_Robot" target="_blank" style="text-decoration: none; margin-top: 8px;">
             ${t('not_reg_btn')}
@@ -6758,8 +6875,8 @@ body.modal-open {
             </div>
           </div>
 
-          <input type="text" id="inp-u" class="input-field" placeholder="Логин (например, test_rest)" />
-          <input type="password" id="inp-p" class="input-field" placeholder="Пароль" />
+          <input type="text" id="inp-u" class="input-field" placeholder="${tr('Логин', 'Username', 'ლოგინი')}" />
+          <input type="password" id="inp-p" class="input-field" placeholder="${tr('Пароль', 'Password', 'პაროლი')}" />
 
           <button class="btn-primary-action" id="btn-login-submit">
             ${t('login_btn')}
@@ -6781,7 +6898,7 @@ body.modal-open {
         syncData();
       } catch (err) {
         haptic('error');
-        alert(err.message || 'Ошибка авторизации');
+        alert(err.message || tr('Ошибка авторизации', 'Sign-in error', 'ავტორიზაციის შეცდომა'));
       }
     });
   }
@@ -6824,7 +6941,7 @@ body.modal-open {
           state.prepTime = prep;
           safeStorage.set('partner_prep_time', prep);
           renderApp();
-          showToast(`Время приготовления: ${prep} минут`);
+          showToast(`${tr('Время приготовления', 'Prep time', 'მომზადების დრო')}: ${prep} ${tr('мин', 'min', 'წთ')}`);
         }
       });
     });
@@ -6833,7 +6950,7 @@ body.modal-open {
       haptic('light');
       state.autoAccept = e.target.checked;
       safeStorage.set('partner_auto_accept', String(state.autoAccept));
-      showToast(state.autoAccept ? 'Авто-приём заказов включён' : 'Авто-приём заказов выключен');
+      showToast(state.autoAccept ? tr('Авто-приём заказов включён', 'Auto-accept is on', 'ავტო-მიღება ჩართულია') : tr('Авто-приём заказов выключен', 'Auto-accept is off', 'ავტო-მიღება გამორთულია'));
     });
 
     document.getElementById('chk-sound-enabled')?.addEventListener('change', (e) => {
@@ -6879,7 +6996,7 @@ body.modal-open {
           state.courierTransport = tr;
           safeStorage.set('courier_transport', tr);
           renderApp();
-          showToast('Транспорт курьера обновлен');
+          showToast(tr('Транспорт курьера обновлен', 'Transport updated', 'ტრანსპორტი განახლდა'));
         }
       });
     });
@@ -6888,9 +7005,9 @@ body.modal-open {
     // Courier Balance Withdrawal
     document.getElementById('btn-courier-withdraw')?.addEventListener('click', () => {
       haptic('success');
-      showToast('Запрос на вывод баланса сформирован!');
+      showToast(tr('Запрос на вывод баланса сформирован!', 'Payout request created!', 'გატანის მოთხოვნა შექმნილია!'));
       setTimeout(() => {
-        window.open('https://t.me/MestiDelivery_Support?text=' + encodeURIComponent('Здравствуйте! Прошу вывести заработанный баланс курьера ' + (state.user?.name || state.user?.username || '')), '_blank');
+        window.open('https://t.me/MestiDelivery_Support?text=' + encodeURIComponent(tr('Здравствуйте! Прошу вывести заработанный баланс курьера', 'Hello! Please pay out my courier balance', 'გამარჯობა! გთხოვთ, გამოიტანოთ კურიერის ბალანსი') + ' ' + (state.user?.name || state.user?.username || '')), '_blank');
       }, 700);
     });
 
@@ -6920,7 +7037,7 @@ body.modal-open {
     // Logout
     document.getElementById('btn-logout')?.addEventListener('click', () => {
       haptic('warning');
-      if (window.confirm('Вы действительно хотите выйти из аккаунта?')) {
+      if (window.confirm(tr('Вы действительно хотите выйти из аккаунта?', 'Sign out of your account?', 'ნამდვილად გსურს გასვლა?'))) {
         safeStorage.clear();
         state.user = null;
         state.orders = [];
@@ -7210,7 +7327,7 @@ body.modal-open {
       const isAvail = document.getElementById('inp-edit-avail')?.checked;
 
       if (!name || isNaN(price)) {
-        alert('Укажите название и корректную цену блюда');
+        alert(tr('Укажите название и корректную цену блюда', 'Enter the dish name and a valid price', 'მიუთითე კერძის სახელი და სწორი ფასი'));
         return;
       }
 
@@ -7242,7 +7359,7 @@ body.modal-open {
       const desc = document.getElementById('inp-add-desc')?.value.trim();
 
       if (!name || isNaN(price) || price <= 0) {
-        alert('Заполните обязательные поля: название и цену блюда');
+        alert(tr('Заполните обязательные поля: название и цену блюда', 'Fill in the required fields: name and price', 'შეავსე სავალდებულო ველები: სახელი და ფასი'));
         return;
       }
 
@@ -7251,7 +7368,7 @@ body.modal-open {
         name,
         price,
         weight,
-        category: category || 'Основное',
+        category: category || tr('Основное', 'Main', 'მთავარი'),
         description: desc,
         is_available: true,
         restaurant_id: state.user?.restaurant_id || 'test_rest_01'
